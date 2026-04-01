@@ -1,0 +1,29 @@
+# Rust build artifacts — nobody wants your 2GB target/ directory
+/target
+
+# Cargo.lock is committed for binaries (this is a binary, not a library)
+# Actually wait, we DO want Cargo.lock for reproducible builds.
+# Uncomment the next line if you hate reproducibility:
+# Cargo.lock
+
+# Windows debug symbols — 200MB of "where did my variable go"
+*.pdb
+
+# IDE bullshit
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS garbage
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# Environment files that might contain secrets
+.env
+.env.*
+
+# Log files from our own server
+MasterControlProgram.log
