@@ -16,9 +16,24 @@ mod win32;
 use rmcp::{ServiceExt, transport::stdio};
 use std::fs::OpenOptions;
 use tracing_subscriber::{self, EnvFilter, fmt, prelude::*};
+use windows::Win32::UI::HiDpi::{
+    DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext,
+};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // Tell Windows we want real pixels, not the scaled-down fantasy version.
+    // Without this, SetCursorPos and GDI capture get virtualized coordinates
+    // on any display that isn't running at 100% scaling — so clicks land in
+    // the wrong place and screenshots come back shrunk. Per-monitor-v2 means
+    // every monitor gets its own real DPI and the virtual-screen coordinates
+    // are actual physical pixels spanning the whole desktop.
+    //
+    // Must run before any DPI-sensitive API. First line of main. No exceptions.
+    unsafe {
+        let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+    }
+
     // Dual logging: stderr for the MCP client that spawned us, and a file for
     // the poor bastard who needs to figure out why shit isn't working.
     // tail -f %TEMP%\MasterControlProgram.log  <-- you're welcome

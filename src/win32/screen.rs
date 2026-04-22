@@ -22,11 +22,16 @@ use base64::{Engine, engine::general_purpose::STANDARD};
 use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
-/// Capture a region of the screen and return (base64_png, width, height).
+/// Capture a region of the screen and return (base64_jpeg, width, height).
 ///
-/// If x/y/width/height are None, captures the primary monitor.
-/// Coordinates are screen coordinates: (0,0) = top-left of primary monitor,
-/// negative x values for monitors to the left.
+/// If x/y/width/height are None, captures the full **virtual screen** —
+/// every monitor, at real physical resolution. Virtual screen coordinates
+/// can be negative: the primary monitor's top-left is (0,0), monitors to
+/// the left have negative X, monitors above have negative Y.
+///
+/// This matches the coordinate space SetCursorPos uses (once the process
+/// is DPI-aware), so a coordinate you see in a screenshot is the same
+/// coordinate you pass to the mouse tools.
 pub fn capture(
     x: Option<i32>,
     y: Option<i32>,
@@ -34,10 +39,13 @@ pub fn capture(
     height: Option<u32>,
 ) -> Result<(String, u32, u32)> {
     unsafe {
-        let cap_x = x.unwrap_or(0);
-        let cap_y = y.unwrap_or(0);
-        let cap_w = width.unwrap_or_else(|| GetSystemMetrics(SM_CXSCREEN) as u32);
-        let cap_h = height.unwrap_or_else(|| GetSystemMetrics(SM_CYSCREEN) as u32);
+        // Defaults span the entire virtual desktop, not just the primary monitor.
+        // SM_XVIRTUALSCREEN / SM_YVIRTUALSCREEN can be negative when monitors
+        // sit to the left or above the primary — that's fine, BitBlt accepts it.
+        let cap_x = x.unwrap_or_else(|| GetSystemMetrics(SM_XVIRTUALSCREEN));
+        let cap_y = y.unwrap_or_else(|| GetSystemMetrics(SM_YVIRTUALSCREEN));
+        let cap_w = width.unwrap_or_else(|| GetSystemMetrics(SM_CXVIRTUALSCREEN) as u32);
+        let cap_h = height.unwrap_or_else(|| GetSystemMetrics(SM_CYVIRTUALSCREEN) as u32);
 
         if cap_w == 0 || cap_h == 0 {
             anyhow::bail!("Invalid capture dimensions: {cap_w}x{cap_h}");

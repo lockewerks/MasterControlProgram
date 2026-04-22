@@ -372,11 +372,11 @@ pub struct ClipboardSetInput {
 // Computer Use — Screen
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct ScreenCaptureInput {
-    #[schemars(description = "X coordinate of capture region top-left (default: 0)")]
+    #[schemars(description = "X coordinate of capture region top-left in virtual screen space (default: left edge of virtual screen, which may be negative on multi-monitor setups)")]
     pub x: Option<i32>,
-    #[schemars(description = "Y coordinate of capture region top-left (default: 0)")]
+    #[schemars(description = "Y coordinate of capture region top-left in virtual screen space (default: top edge of virtual screen, which may be negative on multi-monitor setups)")]
     pub y: Option<i32>,
-    #[schemars(description = "Width of capture region in pixels (default: primary monitor width)")]
+    #[schemars(description = "Width of capture region in physical pixels (default: full virtual screen width across all monitors)")]
     pub width: Option<u32>,
     #[schemars(description = "Height of capture region in pixels (default: primary monitor height)")]
     pub height: Option<u32>,
@@ -385,17 +385,17 @@ pub struct ScreenCaptureInput {
 // Computer Use — Mouse
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct MouseMoveInput {
-    #[schemars(description = "Target X coordinate (screen pixels)")]
+    #[schemars(description = "Target X coordinate in virtual screen pixels (matches screen_capture coordinates exactly — can be negative for monitors left of primary)")]
     pub x: i32,
-    #[schemars(description = "Target Y coordinate (screen pixels)")]
+    #[schemars(description = "Target Y coordinate in virtual screen pixels (matches screen_capture coordinates exactly — can be negative for monitors above primary)")]
     pub y: i32,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct MouseClickInput {
-    #[schemars(description = "X coordinate to click at (default: current position)")]
+    #[schemars(description = "X coordinate to click at in virtual screen pixels (default: current position)")]
     pub x: Option<i32>,
-    #[schemars(description = "Y coordinate to click at (default: current position)")]
+    #[schemars(description = "Y coordinate to click at in virtual screen pixels (default: current position)")]
     pub y: Option<i32>,
     #[schemars(description = "Button: left, right, or middle (default: left)")]
     pub button: Option<String>,
@@ -405,9 +405,9 @@ pub struct MouseClickInput {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct MouseScrollInput {
-    #[schemars(description = "X coordinate to scroll at (default: current position)")]
+    #[schemars(description = "X coordinate to scroll at in virtual screen pixels (default: current position)")]
     pub x: Option<i32>,
-    #[schemars(description = "Y coordinate to scroll at (default: current position)")]
+    #[schemars(description = "Y coordinate to scroll at in virtual screen pixels (default: current position)")]
     pub y: Option<i32>,
     #[schemars(description = "Scroll clicks: positive=up, negative=down")]
     pub clicks: i32,
@@ -415,13 +415,13 @@ pub struct MouseScrollInput {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct MouseDragInput {
-    #[schemars(description = "Start X coordinate")]
+    #[schemars(description = "Start X coordinate in virtual screen pixels")]
     pub start_x: i32,
-    #[schemars(description = "Start Y coordinate")]
+    #[schemars(description = "Start Y coordinate in virtual screen pixels")]
     pub start_y: i32,
-    #[schemars(description = "End X coordinate")]
+    #[schemars(description = "End X coordinate in virtual screen pixels")]
     pub end_x: i32,
-    #[schemars(description = "End Y coordinate")]
+    #[schemars(description = "End Y coordinate in virtual screen pixels")]
     pub end_y: i32,
     #[schemars(description = "Button: left, right, or middle (default: left)")]
     pub button: Option<String>,
@@ -1470,7 +1470,7 @@ impl MasterControlProgram {
     // move the mouse, click things, type text, press key combos. These are
     // all native Win32 via SendInput and GDI — no PowerShell in the loop.
 
-    #[tool(description = "Capture a screenshot of the screen or a specific region. Returns the image as JPEG. Use this to see what's on screen before taking actions.")]
+    #[tool(description = "Capture a screenshot of the full virtual screen (all monitors) or a specific region. Returns the image as JPEG. Coordinates used here match exactly what the mouse tools expect — in virtual screen pixels, which can be negative on multi-monitor setups. Use this to see what's on screen before taking actions.")]
     async fn screen_capture(
         &self,
         Parameters(input): Parameters<ScreenCaptureInput>,
