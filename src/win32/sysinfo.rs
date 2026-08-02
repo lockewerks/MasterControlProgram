@@ -4,11 +4,11 @@
 //! You'd be wrong. GetVersionExW was deprecated because apps were using it to
 //! lie about compatibility, so now it LIES TO YOU and returns Windows 8 for
 //! everything. The official workaround? Read the version from the fucking
-//! REGISTRY. That's right — Microsoft deprecated the version API and told
+//! REGISTRY. That's right. Microsoft deprecated the version API and told
 //! everyone to go scrape it from HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion
 //! like we're parsing config files in 1998.
 //!
-//! GlobalMemoryStatusEx requires you to set dwLength before calling — because
+//! GlobalMemoryStatusEx requires you to set dwLength before calling. Because
 //! OBVIOUSLY. GetLogicalDriveStringsW returns drives as a double-null-terminated
 //! string, because apparently a simple array was too mainstream.
 
@@ -26,7 +26,7 @@ use windows::Win32::System::SystemInformation::*;
 /// way of making you set struct sizes before calling.
 pub fn system_info() -> anyhow::Result<String> {
     unsafe {
-        // Computer name — at least this one is relatively straightforward.
+        // Computer name: at least this one is relatively straightforward.
         // GetComputerNameExW only has three variants of computer name to
         // choose from. We use DnsHostname because it's 2026 and NetBIOS
         // can rot in peace.
@@ -39,7 +39,7 @@ pub fn system_info() -> anyhow::Result<String> {
         )?;
         let hostname = String::from_utf16_lossy(&name_buf[..name_len as usize]);
 
-        // Memory info — set dwLength or it silently fails. I'll say it until
+        // Memory info: set dwLength or it silently fails. I'll say it until
         // I die: this is the worst API pattern Microsoft ever invented and they
         // put it in EVERY. SINGLE. STRUCT.
         let mut mem = MEMORYSTATUSEX {
@@ -48,7 +48,7 @@ pub fn system_info() -> anyhow::Result<String> {
         };
         GlobalMemoryStatusEx(&mut mem)?;
 
-        // System info — one of the rare Win32 functions that just... works.
+        // System info: one of the rare Win32 functions that just... works.
         // No pre-initialization, no double-call, just fills in the struct.
         // I'm suspicious.
         let mut sysinfo = SYSTEM_INFO::default();
@@ -144,8 +144,8 @@ fn get_os_version_from_registry() -> Option<serde_json::Map<String, serde_json::
 
 /// Returns detailed memory statistics. Calls GlobalMemoryStatusEx which,
 /// despite having "Global" in the name, gives you physical memory info.
-/// Also includes page file and virtual memory stats because why not —
-/// it's not like anyone can keep track of which "memory" number means what.
+/// Also includes page file and virtual memory stats because why not.
+/// It's not like anyone can keep track of which "memory" number means what.
 /// Don't forget to set dwLength first! (He said, for the thousandth time.)
 pub fn memory_info() -> anyhow::Result<String> {
     unsafe {
@@ -172,11 +172,11 @@ pub fn memory_info() -> anyhow::Result<String> {
 }
 
 /// Enumerates logical drives and returns their info. GetLogicalDriveStringsW
-/// returns ALL drive letters as one big string: "C:\\\0D:\\\0E:\\\0\0" — a
+/// returns ALL drive letters as one big string: "C:\\\0D:\\\0E:\\\0\0", a
 /// double-null-terminated sequence of null-terminated strings. Because arrays
 /// are for other operating systems. For each drive we then call
 /// GetVolumeInformationW (volume name, filesystem type) and
-/// GetDiskFreeSpaceExW (free/total space) — three API calls per drive letter.
+/// GetDiskFreeSpaceExW (free/total space): three API calls per drive letter.
 /// If you have 5 drives, that's 16 syscalls for what should be one list.
 pub fn disk_info() -> anyhow::Result<String> {
     unsafe {
@@ -198,7 +198,7 @@ pub fn disk_info() -> anyhow::Result<String> {
                     let drive_wide = to_wide(&drive_str);
                     let pcwstr = windows::core::PCWSTR(drive_wide.as_ptr());
 
-                    // Volume info — name, serial number, max component length, flags,
+                    // Volume info: name, serial number, max component length, flags,
                     // and filesystem name. Five out-params. Just vibing.
                     let mut vol_name = vec![0u16; 256];
                     let mut fs_name = vec![0u16; 256];
@@ -214,7 +214,7 @@ pub fn disk_info() -> anyhow::Result<String> {
                         Some(&mut fs_name),
                     ).is_ok();
 
-                    // Free space — because this is a separate API call from volume info.
+                    // Free space. Because this is a separate API call from volume info.
                     // Obviously.
                     let mut free_caller: u64 = 0;
                     let mut total: u64 = 0;
@@ -238,8 +238,8 @@ pub fn disk_info() -> anyhow::Result<String> {
                             2 => "Removable",    // DRIVE_REMOVABLE
                             3 => "Fixed",         // DRIVE_FIXED
                             4 => "Network",       // DRIVE_REMOTE
-                            5 => "CD-ROM",        // DRIVE_CDROM — what year is it?
-                            6 => "RAMDisk",       // DRIVE_RAMDISK — for the three people who use these
+                            5 => "CD-ROM",        // DRIVE_CDROM. What year is it?
+                            6 => "RAMDisk",       // DRIVE_RAMDISK, for the three people who use these
                             _ => "Unknown",
                         },
                     }));

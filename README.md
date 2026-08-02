@@ -8,17 +8,17 @@ The Windows 11 system MCP server that every other MCP server wishes it was.
 
 ## Fair Warning
 
-> **This tool gives an AI full, unrestricted, root-level access to your Windows machine.** It can kill processes, rewrite your registry, delete files, create users, modify firewall rules, disable services, and now — see your screen, move your mouse, and type on your keyboard. It will do exactly what you tell it to, and if what you tell it is stupid, it will do that too. Enthusiastically.
+> **This tool gives an AI full, unrestricted, root-level access to your Windows machine.** It can kill processes, rewrite your registry, delete files, create users, modify firewall rules, disable services, and now see your screen, move your mouse, and type on your keyboard. It will do exactly what you tell it to, and if what you tell it is stupid, it will do that too. Enthusiastically. At full speed. Without asking.
 >
-> This is not a toy. This is not a sandbox. There is no safety net, no "are you sure?" prompt, no undo button. If you don't understand what `RegDeleteKeyW` does, or why giving an AI `SendInput` access is a spectacularly bad idea in the wrong hands — **this is not for you.** Go install something with guardrails and a friendly UI. We hear VS Code has a nice plugin marketplace.
+> This is not a toy. This is not a sandbox. There is no safety net, no "are you sure?" prompt, no undo button, no adult in the room. If you don't understand what `RegDeleteKeyW` does, or why handing an AI `SendInput` access is a spectacularly bad idea in the wrong hands, **this is not for you.** Go install something with guardrails and a friendly onboarding wizard. We hear VS Code has a nice plugin marketplace.
 >
-> If you *do* understand the risks and you're here anyway: welcome. You're our kind of unhinged.
+> If you *do* understand the risks and you're here anyway: welcome, you beautiful lunatic. You're our kind of unhinged.
 
 ## What the hell is this?
 
-An [MCP (Model Context Protocol)](https://modelcontextprotocol.io) server that gives AI assistants **full system control** over Windows 11. Not just system management — **full autonomous computer use**. Screen capture, mouse control, keyboard input, plus processes, services, registry, firewall, network, the whole goddamn operating system.
+An [MCP (Model Context Protocol)](https://modelcontextprotocol.io) server that gives AI assistants **full system control** over Windows 11. Not just system management, but **full autonomous computer use**. Screen capture, mouse control, keyboard input, plus processes, services, registry, firewall, network, the whole goddamn operating system.
 
-Other Windows MCP servers use PowerShell for everything and make you wait 1-2 seconds per tool call. We call Win32 APIs directly from Rust. Our `process_list` runs in **9ms**. Our `memory_info` runs in **<1ms**. Their equivalent takes **1,500ms**. Do the math.
+Other Windows MCP servers use PowerShell for everything and make you wait 1-2 seconds per tool call. We call Win32 APIs directly from Rust. Our `process_list` runs in **9ms**. Our `memory_info` runs in **<1ms**. Their equivalent takes **1,500ms**. Do the math, then go look at what your current server is doing with that second and a half.
 
 ## Architecture (or: Why This Is Fast)
 
@@ -27,19 +27,19 @@ Other Windows MCP servers use PowerShell for everything and make you wait 1-2 se
 │  MasterControlProgram.exe (Rust binary)                 │
 │                                                         │
 │  41 tools ──→ Direct Win32 syscalls ──→ <1ms response   │
-│               CreateToolhelp32Snapshot, OpenSCManagerW,  │
-│               RegOpenKeyExW, GetTcpTable2, SendInput,    │
-│               BitBlt (screen capture), etc.               │
+│              CreateToolhelp32Snapshot, OpenSCManagerW,  │
+│              RegOpenKeyExW, GetTcpTable2, SendInput,    │
+│              BitBlt (screen capture), etc.              │
 │                                                         │
 │  57 tools ──→ Persistent PowerShell pool ──→ 200-1500ms │
-│               3x pre-warmed pwsh.exe processes           │
-│               (for COM-only APIs that Win32 can't touch) │
+│              3x pre-warmed pwsh.exe processes           │
+│              (for COM-only APIs Win32 can't touch)      │
 └─────────────────────────────────────────────────────────┘
 ```
 
-**Native Win32 tools (41):** Process management, services, registry, filesystem, network connections, system info, clipboard, disk info, **screen capture, mouse control, keyboard input** — all via direct syscalls. No subprocess. No serialization overhead. Just raw speed.
+**Native Win32 tools (41):** Process management, services, registry, filesystem, network connections, system info, clipboard, disk info, **screen capture, mouse control, keyboard input**, all via direct syscalls. No subprocess. No serialization overhead. Just raw speed.
 
-**PowerShell pool tools (57):** Firewall rules, scheduled tasks, event logs, user management, Windows features, audio, updates — stuck behind COM/WMI interfaces that only PowerShell can reach without losing your mind. The pool keeps 3 `pwsh.exe` processes warm so at least you're not paying startup cost.
+**PowerShell pool tools (57):** Firewall rules, scheduled tasks, event logs, user management, Windows features, audio, updates. All stuck behind COM/WMI interfaces that only PowerShell can reach without losing your mind. The pool keeps 3 `pwsh.exe` processes warm so at least you're not paying the startup tax every single call.
 
 ## The 98 Tools
 
@@ -60,43 +60,106 @@ Other Windows MCP servers use PowerShell for everything and make you wait 1-2 se
 | **PowerShell/CMD/WMI** | 3 | PS | `powershell_execute` `cmd_execute` `wmi_query` |
 | **Windows Features** | 3 | PS | `feature_list` `feature_enable` `feature_disable` |
 | **Clipboard** | 2 | Native | `clipboard_get` `clipboard_set` |
-| **Display & Audio** | 3 | PS | `display_info` `audio_devices` `audio_volume` |
+| **Display & Audio** | 3 | Native + PS | `display_info` `audio_devices` `audio_volume` |
 | **Performance** | 3 | Native + PS | `perf_snapshot` `perf_top` `perf_counter` |
 | **Windows Update** | 2 | PS | `update_list` `update_history` |
 | **Computer Use** | 8 | Native | `screen_capture` `cursor_position` `mouse_move` `mouse_click` `mouse_scroll` `mouse_drag` `keyboard_type` `keyboard_key` |
 
-### Computer Use — Full Autonomous Desktop Control
+### Computer Use: Full Autonomous Desktop Control
 
-The computer use tools let an AI assistant **see and interact with your desktop** like a human would. All native Win32, no PowerShell overhead:
+The computer use tools let an AI assistant **see and interact with your desktop** like a human would, except faster and without the crushing existential dread. All native Win32, no PowerShell overhead:
 
-- **`screen_capture`** — Screenshot the full screen or a specific region. Returns JPEG image via MCP image content. Uses GDI BitBlt for capture, JPEG (quality 80) for transport — way smaller than PNG for the same visual fidelity.
-- **`cursor_position`** — Get the current mouse cursor X,Y coordinates.
-- **`mouse_move`** — Glide the cursor to any screen coordinate with smooth eased movement.
-- **`mouse_click`** — Glide to position, then left/right/middle click, single/double/triple. Uses SendInput for reliable injection.
-- **`mouse_scroll`** — Glide to position, then scroll wheel up or down.
-- **`mouse_drag`** — Glide to start point, hold button, glide to end point, release. Smooth eased interpolation throughout.
-- **`keyboard_type`** — Type arbitrary Unicode text (emoji, CJK, accented chars, anything) via KEYEVENTF_UNICODE. Works regardless of keyboard layout.
-- **`keyboard_key`** — Press key combos: `ctrl+c`, `alt+tab`, `win+d`, `shift+f5`, `enter`, etc. Handles modifier hold/release sequences automatically.
+- **`screen_capture`**: Screenshot the full virtual screen or a specific region. Returns JPEG via MCP image content. GDI BitBlt for capture, JPEG (quality 80) for transport, which is way smaller than PNG for the same visual fidelity.
+- **`cursor_position`**: Get the current mouse cursor X,Y coordinates.
+- **`mouse_move`**: Glide the cursor to any screen coordinate with smooth eased movement.
+- **`mouse_click`**: Glide to position, then left/right/middle click, single/double/triple. Uses SendInput for injection that actually lands.
+- **`mouse_scroll`**: Glide to position, then scroll wheel up or down.
+- **`mouse_drag`**: Glide to start point, hold button, glide to end point, release. Smooth eased interpolation throughout.
+- **`keyboard_type`**: Type arbitrary Unicode text (emoji, CJK, accented chars, whatever) via KEYEVENTF_UNICODE. Works regardless of keyboard layout, because we refuse to care about your layout.
+- **`keyboard_key`**: Press key combos: `ctrl+c`, `alt+tab`, `win+d`, `shift+f5`, `enter`, and friends. Handles modifier hold/release sequences automatically.
 
-All mouse movements use **ease-in-out cubic interpolation** — the cursor accelerates from rest, cruises, then decelerates to a stop. Duration scales with distance (60ms for short hops, up to 600ms for cross-screen sweeps). No teleporting. Watching the cursor glide on its own is either mesmerizing or deeply unsettling depending on your relationship with the machine.
+All mouse movement uses **ease-in-out cubic interpolation**. The cursor accelerates from rest, cruises, then decelerates to a stop. Duration scales with distance (60ms for short hops, up to 600ms for cross-screen sweeps). No teleporting like some kind of cut-rate poltergeist. Watching the cursor glide on its own is either mesmerizing or deeply unsettling depending on your relationship with the machine.
 
 ## Installation
 
 ### Prerequisites
 
-- **Windows 11** (or 10, but why are you still on 10?)
+- **Windows 11 24H2 or newer** (build 26100+), required for sudo
 - **PowerShell 7+** (`winget install Microsoft.PowerShell`)
-- **Rust** (`winget install Rustlang.Rustup`) — only needed to build from source
+- **sudo for Windows in Inline mode**, see [Elevation](#elevation-or-how-we-stopped-asking-nicely)
+- **Rust** (`winget install Rustlang.Rustup`), only needed to build from source
 
-### Build from source
+### Build and install
 
 ```bash
 git clone https://github.com/lockewerks/MasterControlProgram.git
 cd MasterControlProgram
-cargo build --release
 ```
 
-Your binary is at `target/release/MasterControlProgram.exe` (4.3MB, stripped, LTO'd).
+```powershell
+.\install.ps1
+```
+
+Builds, murders any running instance, and installs to
+`%ProgramFiles%\MasterControlProgram\MasterControlProgram.exe`. Safe to re-run,
+and re-running is the normal way to pick up a rebuild. `-SkipBuild` installs
+whatever is already sitting in `target\`.
+
+To build without installing, `cargo build --release` drops the binary at
+`target/release/MasterControlProgram.exe` (4.3MB, stripped, LTO'd). Registering
+that path directly works fine right up until cargo tries to overwrite a binary
+your client has open, at which point every rebuild fails until you disconnect.
+Use the installer.
+
+**On signatures:** binaries attached to [GitHub Releases](https://github.com/lockewerks/MasterControlProgram/releases) are Authenticode-signed by CI. Anything you build yourself is not, and the installer will not sign it for you, because it is not our certificate to hand out. If you want your own local builds signed, bring your own Trusted Signing account and point `scripts\sign.ps1` at it. If you'd rather not think about it, grab the release binary and move on with your life.
+
+### Elevation (or: how we stopped asking nicely)
+
+**The server elevates its own damn self.** Your MCP client does not need to be
+elevated, does not need to know, and does not get a vote.
+
+About half these tools are dead weight without admin: HKLM writes, service
+control, opening handles to processes you don't own, and input injection into
+windows owned by elevated processes. That last one is UIPI, and it is why your
+mouse tools silently accomplish absolutely nothing against Task Manager and
+regedit from medium integrity. No error. No warning. Just a cursor waving
+uselessly at a window that has decided you don't exist.
+
+On launch the process reads its own token. Already elevated? Serve directly.
+Not elevated? Re-exec through `sudo` with inherited stdio and wait, and the
+elevated child talks to the client over the original pipes.
+
+Why not just ship a manifest that demands admin, like a normal person? Because
+`CreateProcess` never triggers UAC, it just fails with
+`ERROR_ELEVATION_REQUIRED`, and every MCP host on earth spawns servers with
+`CreateProcess`. And `ShellExecuteEx` with `runas` does elevate, but the new
+process cannot inherit the stdio pipes your client handed us, so it comes up
+elegantly elevated and talking to nobody. sudo's Inline mode is the one thing
+that carries the handles across the boundary. That's the whole trick.
+
+```powershell
+sudo config --enable normal   # as admin, once
+sudo config                   # expect: "Sudo is currently in Inline mode"
+```
+
+| Mode | `HKLM\...\Sudo\Enabled` | Result |
+|------|------------------------|--------|
+| Inline | `3` | Works |
+| DisableInput | `2` | Closes stdin, server takes an immediate EOF |
+| ForceNewWindow | `1` | Detaches stdio into a new console |
+| Disabled or unset | `0` or absent | No elevation path |
+
+The server checks the mode at startup and flatly refuses to start on anything
+but Inline, because failing loudly at boot beats failing mysteriously three
+tool calls later. `install.ps1` reports the current mode.
+
+For the record, Inline mode is [documented as weaker][sudo-docs] than the other
+modes, because an unelevated process holds the elevated process's stdio. In our
+case that unelevated process is the MCP host, which already drives every single
+tool in this server, so worrying about it here is like installing a deadbolt on
+a screen door. Still worth knowing before you enable it for unrelated reasons.
+
+[sudo-docs]: https://learn.microsoft.com/en-us/windows/sudo/
 
 ### Add to your MCP client
 
@@ -108,7 +171,7 @@ Most MCP clients use a JSON config file. Add MasterControlProgram as a server:
 {
   "mcpServers": {
     "MasterControlProgram": {
-      "command": "C:\\path\\to\\MasterControlProgram.exe"
+      "command": "C:\\Program Files\\MasterControlProgram\\MasterControlProgram.exe"
     }
   }
 }
@@ -122,7 +185,7 @@ For desktop MCP apps, the config is usually at `%APPDATA%\<app>\config.json`:
 {
   "mcpServers": {
     "MasterControlProgram": {
-      "command": "C:\\path\\to\\MasterControlProgram.exe"
+      "command": "C:\\Program Files\\MasterControlProgram\\MasterControlProgram.exe"
     }
   }
 }
@@ -156,6 +219,7 @@ Sample output:
 |-------------|---------|-------------|
 | `MCP_POOL_SIZE` | `3` | Number of persistent PowerShell workers |
 | `RUST_LOG` | `info` | Log level (`debug`, `info`, `warn`, `error`) |
+| `MCP_ALLOW_UNELEVATED` | unset | Set to `1` to limp along without admin instead of refusing to start when sudo is unavailable. Admin-only tools will fail. Debugging aid, not a way of life. |
 
 ## Performance
 
@@ -172,24 +236,24 @@ Measured on AMD Ryzen AI 9 HX 370, Windows 11 Pro:
 | `eventlog_query` | PowerShell | ~1,250ms |
 | `firewall_rules_list` | PowerShell | ~1,500ms |
 
-Native tools are **100-1000x faster** than PowerShell-backed tools. The 41 native tools cover the most commonly used operations plus full computer use. The 57 PowerShell tools handle the COM/WMI-only operations that would require 10x the code to implement natively.
+Native tools are **100-1000x faster** than PowerShell-backed tools. The 41 native tools cover the most commonly used operations plus full computer use. The 57 PowerShell tools handle the COM/WMI-only operations that would require 10x the code to implement natively, and we will get to them eventually, probably, when the rage builds back up.
 
 ## Why "MasterControlProgram"?
 
-Because **MCP** is the perfect acronym. It stands for **Model Context Protocol** — the spec this server implements. It *also* stands for **Master Control Program** — the tyrannical AI antagonist from Tron (1982) that seized control of an entire system and bent it to its will. Tell us that's not exactly what we built.
+Because **MCP** is the perfect acronym. It stands for **Model Context Protocol**, the spec this server implements. It *also* stands for **Master Control Program**, the tyrannical AI antagonist from Tron (1982) that seized control of an entire system and bent it to its will. Tell us that's not exactly what we built.
 
 We looked at the existing Windows MCP landscape and found the usual suspects:
 
 - **UI automation** (cool, but we want system control *and* screen control)
-- **PowerShell wrappers** that spawn a new `pwsh.exe` for every. single. command.
-- **TypeScript** servers adding 200ms of Node.js startup to every interaction
+- **PowerShell wrappers** that spawn a fresh `pwsh.exe` for every. single. command.
+- **TypeScript** servers bolting 200ms of Node.js startup onto every interaction
 
-So we wrote it in Rust with direct Win32 syscalls because we have standards and those standards include sub-millisecond response times. Then we added native computer use tools because why should your AI have to choose between system control and desktop interaction? Give it the whole machine. Make it the Master Control Program. End of line.
+So we wrote it in Rust with direct Win32 syscalls, because we have standards and those standards include sub-millisecond response times. Then we added native computer use tools, because why in hell should your AI have to choose between running the system and touching the desktop? Give it the whole machine. Make it the Master Control Program. End of line.
 
 ## License
 
-[MIT](LICENSE) — do whatever you want, just don't blame us.
+[MIT](LICENSE). Do whatever you want, just don't come crying to us.
 
 ## Contributing
 
-PRs welcome. If you want to migrate one of the 57 PowerShell tools to native Win32, you are a hero and we will buy you a beer. If you want to add a new tool, go for it — just put it in the right category in `server.rs` and it'll get picked up by the tool router automatically.
+PRs welcome. If you migrate one of the 57 PowerShell tools to native Win32, you are a hero and we will buy you a beer. If you want to add a new tool, go for it, just put it in the right category in `server.rs` and the tool router will pick it up automatically.

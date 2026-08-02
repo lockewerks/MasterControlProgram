@@ -15,7 +15,7 @@
 
 use super::pretty;
 use serde_json::json;
-use std::net::{Ipv4Addr, SocketAddrV4, TcpStream};
+use std::net::{Ipv4Addr, TcpStream};
 use std::time::Duration;
 
 /// Lists all TCP connections on the system. Gets the TCP table (after the
@@ -143,7 +143,7 @@ pub fn config() -> anyhow::Result<String> {
             let name = super::from_wide(adapter.FriendlyName.0);
             let desc = super::from_wide(adapter.Description.0);
 
-            // Collect IP addresses — yet another linked list to traverse.
+            // Collect IP addresses: yet another linked list to traverse.
             // Each unicast address points to the next one via .Next.
             // Arrays? Never heard of 'em.
             let mut ips = Vec::new();
@@ -177,7 +177,7 @@ pub fn config() -> anyhow::Result<String> {
                 unicast = (*unicast).Next; // Follow the linked list. Like an animal.
             }
 
-            // DNS servers — ANOTHER linked list hanging off the adapter struct.
+            // DNS servers: ANOTHER linked list hanging off the adapter struct.
             // It's linked lists all the way down.
             let mut dns_servers = Vec::new();
             let mut dns = adapter.FirstDnsServerAddress;
@@ -195,7 +195,7 @@ pub fn config() -> anyhow::Result<String> {
                 dns = (*dns).Next;
             }
 
-            // Gateways — oh look, ANOTHER linked list. I'm starting to think
+            // Gateways, oh look, ANOTHER linked list. I'm starting to think
             // the person who designed this data structure only knew one.
             let mut gateways = Vec::new();
             let mut gw = adapter.FirstGatewayAddress;

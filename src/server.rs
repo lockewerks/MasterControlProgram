@@ -1,4 +1,4 @@
-//! # The Server — 98 Tools of Pure Windows Domination
+//! # The Server: 98 Tools of Pure Windows Domination
 //!
 //! This is the big one. 98 MCP tools across 19 categories, crammed into one
 //! glorious `#[tool_router]` impl block because the rmcp macro demands it.
@@ -378,7 +378,7 @@ pub struct ClipboardSetInput {
     pub text: String,
 }
 
-// Computer Use — Screen
+// Computer Use: Screen
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct ScreenCaptureInput {
     #[schemars(description = "X coordinate of capture region top-left in virtual screen space (default: left edge of virtual screen, which may be negative on multi-monitor setups)")]
@@ -395,13 +395,13 @@ pub struct ScreenCaptureInput {
     pub height: Option<u32>,
 }
 
-// Computer Use — Mouse
+// Computer Use: Mouse
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct MouseMoveInput {
-    #[schemars(description = "Target X coordinate in virtual screen pixels (matches screen_capture coordinates exactly — can be negative for monitors left of primary)")]
+    #[schemars(description = "Target X coordinate in virtual screen pixels (matches screen_capture coordinates exactly; can be negative for monitors left of primary)")]
     #[serde(deserialize_with = "crate::coerce::num")]
     pub x: i32,
-    #[schemars(description = "Target Y coordinate in virtual screen pixels (matches screen_capture coordinates exactly — can be negative for monitors above primary)")]
+    #[schemars(description = "Target Y coordinate in virtual screen pixels (matches screen_capture coordinates exactly; can be negative for monitors above primary)")]
     #[serde(deserialize_with = "crate::coerce::num")]
     pub y: i32,
 }
@@ -452,7 +452,7 @@ pub struct MouseDragInput {
     pub button: Option<String>,
 }
 
-// Computer Use — Keyboard
+// Computer Use: Keyboard
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct KeyboardTypeInput {
     #[schemars(description = "Text to type (supports full Unicode including emoji)")]
@@ -492,11 +492,11 @@ pub struct MasterControlProgram {
     /// The PowerShell sweatshop. 57 tools still need this.
     ps: Arc<ps::Pool>,
     /// Auto-generated tool router. Maps tool names to handler methods.
-    /// Don't touch this — the macro handles it.
+    /// Don't touch this. The macro handles it.
     tool_router: ToolRouter<Self>,
 }
 
-// Helpers — because typing Ok(CallToolResult::success(vec![Content::text(...)]))
+// Helpers, because typing Ok(CallToolResult::success(vec![Content::text(...)]))
 // ninety goddamn times would make anyone lose the will to live.
 fn ok(text: String) -> Result<CallToolResult, McpError> {
     Ok(CallToolResult::success(vec![Content::text(text)]))
@@ -573,8 +573,8 @@ macro_rules! native {
 // dispatcher that maps tool names to handler methods. Every #[tool]
 // attribute becomes a callable MCP tool with auto-generated JSON Schema.
 //
-// native!() = direct Win32 syscall, <1ms    (41 tools — the fast ones)
-// ps!()     = PowerShell pool, 200-1500ms   (57 tools — the slow but necessary ones)
+// native!() = direct Win32 syscall, <1ms    (41 tools, the fast ones)
+// ps!()     = PowerShell pool, 200-1500ms   (57 tools, the slow but necessary ones)
 
 #[tool_router]
 impl MasterControlProgram {
@@ -641,7 +641,7 @@ impl MasterControlProgram {
         native!(crate::win32::process::detail(input.pid))
     }
 
-    #[tool(description = "Kill/terminate a process by PID. Use with caution — this force-terminates the process.")]
+    #[tool(description = "Kill/terminate a process by PID. Use with caution: this force-terminates the process.")]
     async fn process_kill(
         &self,
         Parameters(input): Parameters<ProcessByPid>,
@@ -657,7 +657,7 @@ impl MasterControlProgram {
         native!(crate::win32::process::start(&input.path, input.args.as_deref(), input.working_dir.as_deref()))
     }
 
-    #[tool(description = "Show process tree — all processes with their parent process IDs for hierarchy visualization")]
+    #[tool(description = "Show process tree: all processes with their parent process IDs for hierarchy visualization")]
     async fn process_tree(&self) -> Result<CallToolResult, McpError> {
         native!(crate::win32::process::tree())
     }
@@ -1358,7 +1358,7 @@ impl MasterControlProgram {
 
     // ── PowerShell / CMD / WMI (3) ──────────────────────────────────────
 
-    #[tool(description = "Execute arbitrary PowerShell commands. The ultimate escape hatch — run any PowerShell you want.")]
+    #[tool(description = "Execute arbitrary PowerShell commands. The ultimate escape hatch: run any PowerShell you want.")]
     async fn powershell_execute(
         &self,
         Parameters(input): Parameters<PsExecuteInput>,
@@ -1494,9 +1494,9 @@ impl MasterControlProgram {
     // ── Computer Use (8) ──────────────────────────────────────────────
     // The crown jewels. Full autonomous computer control: see the screen,
     // move the mouse, click things, type text, press key combos. These are
-    // all native Win32 via SendInput and GDI — no PowerShell in the loop.
+    // all native Win32 via SendInput and GDI. No PowerShell in the loop.
 
-    #[tool(description = "Capture a screenshot of the full virtual screen (all monitors) or a specific region. Returns the image as JPEG. Coordinates used here match exactly what the mouse tools expect — in virtual screen pixels, which can be negative on multi-monitor setups. Use this to see what's on screen before taking actions.")]
+    #[tool(description = "Capture a screenshot of the full virtual screen (all monitors) or a specific region. Returns the image as JPEG. Coordinates used here match exactly what the mouse tools expect, in virtual screen pixels, which can be negative on multi-monitor setups. Use this to see what's on screen before taking actions.")]
     async fn screen_capture(
         &self,
         Parameters(input): Parameters<ScreenCaptureInput>,
@@ -1560,7 +1560,7 @@ impl MasterControlProgram {
         native!(crate::win32::input::mouse_drag(input.start_x, input.start_y, input.end_x, input.end_y, button))
     }
 
-    #[tool(description = "Type literal text strings by injecting Unicode character events. Use this ONLY for typing visible text into fields, editors, or documents — NOT for keyboard shortcuts, hotkeys, or special keys. For Ctrl+C, Enter, Escape, Tab, arrow keys, F-keys, or any modifier combo, use keyboard_key instead.")]
+    #[tool(description = "Type literal text strings by injecting Unicode character events. Use this ONLY for typing visible text into fields, editors, or documents. NOT for keyboard shortcuts, hotkeys, or special keys. For Ctrl+C, Enter, Escape, Tab, arrow keys, F-keys, or any modifier combo, use keyboard_key instead.")]
     async fn keyboard_type(
         &self,
         Parameters(input): Parameters<KeyboardTypeInput>,

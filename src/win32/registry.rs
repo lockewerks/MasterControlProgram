@@ -7,7 +7,7 @@
 //! back up properly?"
 //!
 //! There are FIVE root hives (HKLM, HKCU, HKCR, HKU, HKCC) because having one
-//! giant tree of sadness wasn't enough — we needed five overlapping trees of sadness.
+//! giant tree of sadness wasn't enough: we needed five overlapping trees of sadness.
 //! HKCR is literally just a merged view of HKLM\Software\Classes and HKCU\Software\Classes.
 //! Why? Don't ask questions you don't want the answer to.
 //!
@@ -45,7 +45,7 @@ fn parse_hive(path: &str) -> anyhow::Result<(HKEY, &str)> {
 /// Turns a WIN32_ERROR into a Result because the registry APIs don't return
 /// HRESULT like civilized Win32 APIs. They return WIN32_ERROR, which is just
 /// a u32 that you compare against ERROR_SUCCESS (which is 0, because success
-/// is nothing and nothing is success — very Zen of Microsoft).
+/// is nothing and nothing is success, very Zen of Microsoft).
 fn win32_ok(err: WIN32_ERROR) -> anyhow::Result<()> {
     if err == ERROR_SUCCESS {
         Ok(())
@@ -97,7 +97,7 @@ fn reg_type_name(t: REG_VALUE_TYPE) -> &'static str {
 
 /// Interprets raw registry value bytes based on the type. This is where the
 /// real fun begins. REG_SZ? Wide string with a null terminator. REG_MULTI_SZ?
-/// Multiple wide strings separated by nulls with a double-null terminator —
+/// Multiple wide strings separated by nulls with a double-null terminator,
 /// a.k.a. "we heard you like null terminators so we put null terminators in
 /// your null-terminated strings." REG_DWORD? Four bytes, little-endian,
 /// because endianness is something we should all still worry about in a
@@ -155,8 +155,8 @@ fn read_value_data(data: &[u8], vtype: REG_VALUE_TYPE) -> serde_json::Value {
     }
 }
 
-/// Reads all values from a registry key. Uses RegEnumValueW, which — you guessed
-/// it — requires TWO calls per value: one to get the data size, one to get the
+/// Reads all values from a registry key. Uses RegEnumValueW, which, you guessed
+/// it, requires TWO calls per value: one to get the data size, one to get the
 /// actual data. The "call it twice" pattern strikes again. Microsoft loves this
 /// pattern like I love strong coffee: desperately and too frequently.
 pub fn read(path: &str) -> anyhow::Result<String> {
@@ -259,7 +259,7 @@ pub fn write(path: &str, name: &str, value: &str, value_type: &str) -> anyhow::R
 
 /// Deletes a registry value, or an entire key if name is "*". RegDeleteKeyExW
 /// for keys, RegDeleteValueW for values. The "*" convention is our own because
-/// the Win32 API has no concept of "delete everything" — you'd normally have to
+/// the Win32 API has no concept of "delete everything"; you'd normally have to
 /// recursively enumerate and delete, because the registry is a tree and trees
 /// don't delete themselves. Unless you're on fire. Like this codebase.
 pub fn delete(path: &str, name: &str) -> anyhow::Result<String> {
@@ -301,7 +301,7 @@ pub fn list_key(path: &str) -> anyhow::Result<String> {
         idx += 1;
     }
 
-    // Enumerate values — here we go again with the two-call tango
+    // Enumerate values: here we go again with the two-call tango
     let mut value_entries = Vec::new();
     idx = 0;
     loop {
@@ -374,7 +374,7 @@ fn search_recursive(hive: HKEY, subpath: &str, pattern: &str, limit: u32, result
         idx += 1;
     }
 
-    // Recurse into subkeys — abandon all hope ye who enter here
+    // Recurse into subkeys: abandon all hope ye who enter here
     idx = 0;
     let mut child_names = Vec::new();
     loop {

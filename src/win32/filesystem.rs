@@ -1,7 +1,7 @@
 //! # Filesystem Operations: FindFirstFileW and the Audacity of 1995
 //!
 //! Welcome to the Windows filesystem API, where we enumerate files using
-//! FindFirstFileW/FindNextFileW — an iterator pattern from Windows 95 that
+//! FindFirstFileW/FindNextFileW, an iterator pattern from Windows 95 that
 //! Microsoft never replaced because "if it ain't broke, don't fix it" is
 //! their entire philosophy (even when it IS broke).
 //!
@@ -25,7 +25,7 @@ use windows::Win32::Foundation::*;
 use windows::Win32::Storage::FileSystem::*;
 
 /// Converts a FILETIME to an ISO 8601 string. FILETIME is 100-nanosecond
-/// intervals since January 1, 1601 — a date chosen because it's the beginning
+/// intervals since January 1, 1601. A date chosen because it's the beginning
 /// of a 400-year Gregorian calendar cycle. You know, the thing everyone thinks
 /// about when designing a timestamp format. We subtract 116,444,736,000,000,000
 /// to get to the Unix epoch because that's how many 100ns intervals there are
@@ -39,8 +39,8 @@ fn filetime_to_iso(ft: &FILETIME) -> String {
     let unix_100ns = ticks - EPOCH_DIFF;
     let secs = unix_100ns / 10_000_000;
     let nanos = ((unix_100ns % 10_000_000) * 100) as u32;
-    let dt = chrono_format(secs as i64, nanos);
-    dt
+    
+    chrono_format(secs as i64, nanos)
 }
 
 /// Formats a Unix timestamp to ISO 8601 WITHOUT the chrono crate because we're
@@ -54,7 +54,7 @@ fn chrono_format(secs: i64, _nanos: u32) -> String {
     let m = (time_of_day % 3600) / 60;
     let s = time_of_day % 60;
 
-    // Days since unix epoch to Y/M/D — implementing the Gregorian calendar
+    // Days since unix epoch to Y/M/D: implementing the Gregorian calendar
     // from scratch in a filesystem module. This is fine. Everything is fine.
     let mut y = 1970i64;
     let mut remaining_days = days;
@@ -159,7 +159,7 @@ fn list_dir(path: &str, hidden: bool, recurse: bool, entries: &mut Vec<serde_jso
 }
 
 /// Searches for files matching a glob pattern, recursively. Uses the same
-/// FindFirstFileW/FindNextFileW pattern twice — once for matching files in
+/// FindFirstFileW/FindNextFileW pattern twice: once for matching files in
 /// the current directory, and once for enumerating subdirectories to recurse
 /// into. It's like doing the same terrible dance twice per directory level.
 pub fn search(path: &str, pattern: &str, limit: u32) -> anyhow::Result<String> {
@@ -170,7 +170,7 @@ pub fn search(path: &str, pattern: &str, limit: u32) -> anyhow::Result<String> {
 
 /// Recursive file search implementation. Two FindFirstFileW loops per directory:
 /// one with the pattern to find matches, one with "*" to find subdirectories.
-/// If you're thinking "couldn't this be one loop?" — yes, absolutely, but then
+/// You're thinking "couldn't this be one loop?" Yes, absolutely, but then
 /// we'd lose the authentic "Win32 API" flavor of doing everything the hard way.
 fn search_dir(path: &str, pattern: &str, results: &mut Vec<serde_json::Value>, limit: usize) -> anyhow::Result<()> {
     if results.len() >= limit { return Ok(()); }
@@ -201,7 +201,7 @@ fn search_dir(path: &str, pattern: &str, results: &mut Vec<serde_json::Value>, l
         }
     }
 
-    // Recurse into subdirectories — second FindFirstFileW loop because
+    // Recurse into subdirectories: second FindFirstFileW loop because
     // we need "\\*" to get all entries, not just pattern matches.
     let dir_search = format!("{}\\*", path.trim_end_matches('\\'));
     let wide = to_wide(&dir_search);
@@ -228,7 +228,7 @@ fn search_dir(path: &str, pattern: &str, results: &mut Vec<serde_json::Value>, l
 }
 
 /// Gets detailed info about a single file/directory. Calls FindFirstFileW
-/// (yes, FIND, even though we know the exact path — there's no GetFileInfoW
+/// (yes, FIND, even though we know the exact path; there's no GetFileInfoW
 /// that returns a WIN32_FIND_DATAW because that would be convenient). Then
 /// calls get_file_owner() which is its own two-API-call adventure to translate
 /// a security descriptor into a human-readable "DOMAIN\username" string.
@@ -244,7 +244,7 @@ pub fn info(path: &str) -> anyhow::Result<String> {
         let size = ((fd.nFileSizeHigh as u64) << 32) | fd.nFileSizeLow as u64;
         let is_dir = fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY.0 != 0;
 
-        // Get owner via GetNamedSecurityInfoW — buckle up for two more API calls
+        // Get owner via GetNamedSecurityInfoW. Buckle up for two more API calls
         let owner = get_file_owner(path).unwrap_or_default();
 
         Ok(pretty(&json!({
@@ -263,7 +263,7 @@ pub fn info(path: &str) -> anyhow::Result<String> {
 }
 
 /// Gets the owner of a file. This is a two-step process because Windows stores
-/// ownership as a binary Security Identifier (SID) — a variable-length blob of
+/// ownership as a binary Security Identifier (SID), a variable-length blob of
 /// bytes that identifies a user, group, or service. To turn this into something
 /// a human can read, you have to:
 ///   1. Call GetNamedSecurityInfoW to get the SID (also allocates a security

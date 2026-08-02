@@ -25,7 +25,7 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 // ─── Smooth Movement ─────────────────────────────────────────────────────────
 // Every mouse movement glides across the screen like an unseen hand.
 // We use ease-in-out cubic interpolation so the cursor accelerates from
-// rest, cruises, then decelerates to a stop — the way a poltergeist would
+// rest, cruises, then decelerates to a stop, the way a poltergeist would
 // move your mouse if it had good taste.
 //
 // Total glide time scales with distance: short moves are quick, long moves
@@ -55,12 +55,12 @@ fn ease_in_out(t: f64) -> f64 {
 /// `SendInput` with `MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK`.
 ///
 /// Why not `SetCursorPos`? SendInput generates real input events that flow
-/// through the full input pipeline — full-screen apps, games, anything with
+/// through the full input pipeline: full-screen apps, games, anything with
 /// a mouse hook sees it as a legitimate move. SetCursorPos can be intercepted
 /// or ignored.
 ///
 /// The normalization formula `n = pos * 65535 / (dim - 1)` maps (0,0) to
-/// the top-left and (dim-1, dim-1) to the bottom-right exactly — no
+/// the top-left and (dim-1, dim-1) to the bottom-right exactly. No
 /// off-by-one at the edges.
 fn send_absolute(x: i32, y: i32) -> Result<()> {
     unsafe {
@@ -134,7 +134,7 @@ fn glide_to(target_x: i32, target_y: i32) -> Result<()> {
             std::thread::sleep(Duration::from_millis(GLIDE_STEP_MS));
         }
 
-        // Nail the landing — floating point can leave us 1px off.
+        // Nail the landing: floating point can leave us 1px off.
         // SendInput absolute again guarantees the pixel is exact.
         send_absolute(target_x, target_y)?;
         Ok(())
@@ -180,7 +180,7 @@ pub fn mouse_click(
         }
 
         let (down, up) = button_flags(button);
-        let click_count = count.max(1).min(5);
+        let click_count = count.clamp(1, 5);
 
         for _ in 0..click_count {
             let inputs = [mouse_input(down), mouse_input(up)];
@@ -263,7 +263,7 @@ pub fn mouse_drag(
         SendInput(&[mouse_input(down)], size_of::<INPUT>() as i32);
         std::thread::sleep(Duration::from_millis(30));
 
-        // Glide to end position — same eased interpolation as regular moves
+        // Glide to end position, same eased interpolation as regular moves
         // but we do it manually here because the button is held down
         let dx = (end_x - start_x) as f64;
         let dy = (end_y - start_y) as f64;
@@ -369,12 +369,12 @@ pub fn keyboard_key(keys: &str) -> Result<String> {
     // Build input sequence: all keys down, then all keys up (reverse order)
     let mut inputs: Vec<INPUT> = Vec::with_capacity(vks.len() * 2);
 
-    // Key down events — in order
+    // Key down events: in order
     for &vk in &vks {
         inputs.push(key_input(vk, false));
     }
 
-    // Key up events — reverse order (release main key first, then modifiers)
+    // Key up events: reverse order (release main key first, then modifiers)
     for &vk in vks.iter().rev() {
         inputs.push(key_input(vk, true));
     }
@@ -382,7 +382,7 @@ pub fn keyboard_key(keys: &str) -> Result<String> {
     unsafe {
         let sent = SendInput(&inputs, size_of::<INPUT>() as i32);
         if sent == 0 {
-            anyhow::bail!("SendInput failed — no events were injected");
+            anyhow::bail!("SendInput failed: no events were injected");
         }
     }
 

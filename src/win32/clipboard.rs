@@ -2,16 +2,16 @@
 //!
 //! You want to put text on the clipboard? Cool. Here's what you have to do:
 //!
-//!   1. `GlobalAlloc` — Allocate global memory with GMEM_MOVEABLE (because the
+//!   1. `GlobalAlloc`: Allocate global memory with GMEM_MOVEABLE (because the
 //!      memory might MOVE, like a Windows-managed nomad)
-//!   2. `GlobalLock` — Lock the memory so it stops moving and gives you a pointer
+//!   2. `GlobalLock`: Lock the memory so it stops moving and gives you a pointer
 //!   3. Copy your bytes into the pointer
-//!   4. `GlobalUnlock` — Let the memory roam free again
-//!   5. `OpenClipboard` — Open the clipboard (takes an optional window handle;
+//!   4. `GlobalUnlock`: Let the memory roam free again
+//!   5. `OpenClipboard`: Open the clipboard (takes an optional window handle;
 //!      pass None for "I don't have a window and I don't care")
-//!   6. `EmptyClipboard` — Clear whatever was there before
-//!   7. `SetClipboardData` — Hand ownership of the memory to the clipboard
-//!   8. `CloseClipboard` — Close the clipboard
+//!   6. `EmptyClipboard`: Clear whatever was there before
+//!   7. `SetClipboardData`: Hand ownership of the memory to the clipboard
+//!   8. `CloseClipboard`: Close the clipboard
 //!
 //! That's EIGHT steps to do what Ctrl+C does in one keystroke. And if you get
 //! the order wrong, or forget to close the clipboard, you've just locked it
@@ -33,10 +33,10 @@ use windows::Win32::System::Memory::*;
 const CF_UNICODETEXT: u32 = 13;
 
 /// Gets the current clipboard text. Opens the clipboard with None as the window
-/// handle (because we don't have a window — we're a fucking MCP server), grabs
+/// handle (because we don't have a window; we're a fucking MCP server), grabs
 /// the data handle, GlobalLock's it to get a pointer, reads the wide string,
 /// then GlobalUnlock's and CloseClipboard's. If this sounds like a lot of
-/// ceremony for "read a string" — it is. It absolutely is.
+/// ceremony for "read a string": it is. It absolutely is.
 pub fn get() -> anyhow::Result<String> {
     unsafe {
         // Open clipboard with no window handle. None means "any window on this
@@ -108,7 +108,7 @@ pub fn set(text: &str) -> anyhow::Result<String> {
         // Step 6: Empty the clipboard. Out with the old.
         let _ = EmptyClipboard();
         // Step 7: Hand the memory to the clipboard. It's the clipboard's problem now.
-        // DO NOT free hmem after this — the clipboard owns it. Double-free = crash.
+        // DO NOT free hmem after this. The clipboard owns it. Double-free = crash.
         let result = SetClipboardData(CF_UNICODETEXT, Some(HANDLE(hmem.0)));
         // Step 8: Close the clipboard. Finally. Jesus Christ. We're done.
         let _ = CloseClipboard();

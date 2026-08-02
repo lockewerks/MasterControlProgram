@@ -1,9 +1,9 @@
 //! # Windows Service Control Manager: Digital Bureaucracy Simulator
 //!
 //! If you've ever fantasized about interacting with a government agency via
-//! raw memory manipulation, congratulations — the SCM is for you. Want to
+//! raw memory manipulation, congratulations: the SCM is for you. Want to
 //! enumerate services? First, open the SCM with the right access rights
-//! (hope you picked correctly!), then call EnumServicesStatusExW TWICE — once
+//! (hope you picked correctly!), then call EnumServicesStatusExW TWICE: once
 //! with a null buffer to ask "how big should the buffer be?" and again with
 //! the actual buffer, because apparently allocating memory is YOUR job here.
 //!
@@ -13,7 +13,6 @@
 
 use super::{pretty, from_wide};
 use serde_json::json;
-use windows::Win32::Foundation::*;
 use windows::Win32::System::Services::*;
 
 /// RAII wrapper for SC_HANDLE because the Service Control Manager predates the
@@ -159,7 +158,7 @@ pub fn detail(name: &str) -> anyhow::Result<String> {
         let scm = open_scm(SC_MANAGER_CONNECT)?;
         let svc = open_service(&scm, name, SERVICE_QUERY_CONFIG | SERVICE_QUERY_STATUS)?;
 
-        // Query status — because knowing if it's running requires a whole
+        // Query status, because knowing if it's running requires a whole
         // separate struct and API call from getting its configuration
         let mut status = SERVICE_STATUS_PROCESS::default();
         let mut needed: u32 = 0;
@@ -173,7 +172,7 @@ pub fn detail(name: &str) -> anyhow::Result<String> {
             &mut needed,
         )?;
 
-        // Query config — call twice pattern, our old nemesis returns
+        // Query config: call twice pattern, our old nemesis returns
         let mut needed2: u32 = 0;
         let _ = QueryServiceConfigW(svc.0, None, 0, &mut needed2);
         let mut config_buf = vec![0u8; needed2 as usize];
@@ -208,7 +207,7 @@ pub fn start(name: &str) -> anyhow::Result<String> {
     }
 }
 
-/// Stops a service by sending SERVICE_CONTROL_STOP. This is the polite way —
+/// Stops a service by sending SERVICE_CONTROL_STOP. This is the polite way:
 /// the service gets a chance to clean up. Unlike TerminateProcess, which is
 /// more of a "surprise, you're dead" situation. Returns "StopPending" because
 /// services don't stop immediately; they enter a bureaucratic limbo state
@@ -224,13 +223,13 @@ pub fn stop(name: &str) -> anyhow::Result<String> {
 }
 
 /// "Restarts" a service by stopping then starting it with a 500ms nap in between.
-/// This is not a real atomic restart — it's the "turn it off, count to one,
+/// This is not a real atomic restart. It's the "turn it off, count to one,
 /// turn it back on" approach. If the service takes longer than 500ms to stop,
 /// well, the start call will probably just fail. Professional-grade engineering.
 pub fn restart(name: &str) -> anyhow::Result<String> {
     // Stop, then start
     let _ = stop(name); // ignore stop errors (might already be stopped)
-    // Brief wait for stop — a.k.a. "hope and prayer driven development"
+    // Brief wait for stop, a.k.a. "hope and prayer driven development"
     std::thread::sleep(std::time::Duration::from_millis(500));
     start(name)
 }

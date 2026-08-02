@@ -5,17 +5,17 @@
 //! compatible bitmaps, and bit-blitting like it's 1995.
 //!
 //! The pipeline:
-//!   1. GetDC(NULL) — get the screen's device context
-//!   2. CreateCompatibleDC — make a memory DC to draw into
-//!   3. CreateCompatibleBitmap — make a bitmap the size of the capture
-//!   4. SelectObject — attach the bitmap to the memory DC
-//!   5. BitBlt — blast screen pixels into our bitmap
-//!   5b. DrawIconEx — paint the mouse cursor on top (GPU renders it as
-//!       a hardware overlay so BitBlt never sees it — without this step
-//!       your screenshots always look cursor-less like a haunted desktop)
-//!   6. GetDIBits — extract raw BGRA pixels from the bitmap
-//!   7. Convert BGRA → RGB (because nobody wants Windows' weirdo byte order)
-//!   8. Encode to JPEG, then base64 for MCP transport
+//!   1. GetDC(NULL): get the screen's device context
+//!   2. CreateCompatibleDC: make a memory DC to draw into
+//!   3. CreateCompatibleBitmap: make a bitmap the size of the capture
+//!   4. SelectObject: attach the bitmap to the memory DC
+//!   5. BitBlt: blast screen pixels into our bitmap
+//!   6. DrawIconEx: paint the mouse cursor on top, because the GPU renders it
+//!      as a hardware overlay and BitBlt never fucking sees it. Skip this and
+//!      every screenshot comes back cursor-less like a haunted desktop.
+//!   7. GetDIBits: extract raw BGRA pixels from the bitmap
+//!   8. Convert BGRA to RGB, because nobody wants Windows' weirdo byte order
+//!   9. Encode to JPEG, then base64 for MCP transport
 //!
 //! NINE steps to take a screenshot. Windows: making the simple complex
 //! since 1985.
@@ -27,7 +27,7 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 
 /// Capture a region of the screen and return (base64_jpeg, width, height).
 ///
-/// If x/y/width/height are None, captures the full **virtual screen** —
+/// If x/y/width/height are None, captures the full **virtual screen**:
 /// every monitor, at real physical resolution. Virtual screen coordinates
 /// can be negative: the primary monitor's top-left is (0,0), monitors to
 /// the left have negative X, monitors above have negative Y.
@@ -44,7 +44,7 @@ pub fn capture(
     unsafe {
         // Defaults span the entire virtual desktop, not just the primary monitor.
         // SM_XVIRTUALSCREEN / SM_YVIRTUALSCREEN can be negative when monitors
-        // sit to the left or above the primary — that's fine, BitBlt accepts it.
+        // sit to the left or above the primary. That's fine, BitBlt accepts it.
         let cap_x = x.unwrap_or_else(|| GetSystemMetrics(SM_XVIRTUALSCREEN));
         let cap_y = y.unwrap_or_else(|| GetSystemMetrics(SM_YVIRTUALSCREEN));
         let cap_w = width.unwrap_or_else(|| GetSystemMetrics(SM_CXVIRTUALSCREEN) as u32);
@@ -62,7 +62,7 @@ pub fn capture(
         let hbm = CreateCompatibleBitmap(hdc_screen, cap_w as i32, cap_h as i32);
         let old_obj = SelectObject(hdc_mem, hbm.into());
 
-        // Step 5: BitBlt — copy screen pixels into our bitmap
+        // Step 5: BitBlt copies screen pixels into our bitmap
         BitBlt(
             hdc_mem,
             0,
@@ -77,7 +77,7 @@ pub fn capture(
 
         // Step 5b: Paint the mouse cursor onto the captured bitmap.
         //
-        // The cursor is drawn by the GPU as a hardware overlay — it's not
+        // The cursor is drawn by the GPU as a hardware overlay. It's not
         // part of the desktop surface that BitBlt copies. So a "raw"
         // screenshot is always cursor-less, which is useless for vision-
         // driven tool loops where the model needs to see what it's pointing
@@ -112,14 +112,14 @@ pub fn capture(
             DIB_RGB_COLORS,
         );
 
-        // Cleanup GDI resources — order matters, reverse of creation
+        // Cleanup GDI resources: order matters, reverse of creation
         SelectObject(hdc_mem, old_obj);
         let _ = DeleteObject(hbm.into());
         let _ = DeleteDC(hdc_mem);
         ReleaseDC(None, hdc_screen);
 
         if lines == 0 {
-            anyhow::bail!("GetDIBits failed — captured 0 scan lines");
+            anyhow::bail!("GetDIBits failed: captured 0 scan lines");
         }
 
         // Step 7: Convert BGRA → RGB for PNG
@@ -133,7 +133,7 @@ pub fn capture(
         }
 
         // Step 8: Encode to JPEG, then base64
-        // JPEG is way smaller than PNG for screenshots — less data to shove
+        // JPEG is way smaller than PNG for screenshots: less data to shove
         // through MCP transport, faster round-trips, everybody wins.
         let mut jpeg_buf = Vec::new();
         let encoder = jpeg_encoder::Encoder::new(&mut jpeg_buf, 80);
@@ -151,7 +151,7 @@ pub fn capture(
 
 /// Draw the current mouse cursor onto the given memory DC, translated into
 /// the capture's local coordinate space. Silently no-ops if the cursor is
-/// hidden or any of the querying APIs fail — a screenshot without a cursor
+/// hidden or any of the querying APIs fail. A screenshot without a cursor
 /// is still a useful screenshot, no reason to fail the whole capture.
 unsafe fn overlay_cursor(hdc_mem: HDC, cap_x: i32, cap_y: i32) {
     unsafe {
@@ -184,7 +184,7 @@ unsafe fn overlay_cursor(hdc_mem: HDC, cap_x: i32, cap_y: i32) {
             ci.hCursor.into(),
             0, // cxWidth = 0 → natural width
             0, // cyHeight = 0 → natural height
-            0, // istepIfAniCur — use frame 0 for static cursors
+            0, // istepIfAniCur: use frame 0 for static cursors
             None, // no flicker-free brush
             DI_NORMAL,
         );

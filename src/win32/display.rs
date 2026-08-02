@@ -3,7 +3,7 @@
 //! Returns one record per physical monitor with its virtual-screen rect,
 //! work area, and orientation pulled from DEVMODE. This replaces the old
 //! PowerShell `Win32_VideoController` path which returned GPU info, not
-//! monitor geometry — and never mentioned rotation at all, it just silently
+//! monitor geometry, and never mentioned rotation at all, it just silently
 //! swapped width and height on portrait monitors which made coordinate math
 //! a guessing game.
 //!

@@ -31,7 +31,7 @@ impl Drop for SafeHandle {
 }
 
 /// Takes a "snapshot" of all running processes using the ToolHelp32 API.
-/// Note the ritual sacrifice on line with `dwSize` — you MUST set this field
+/// Note the ritual sacrifice on line with `dwSize`: you MUST set this field
 /// to the struct size or the API silently returns garbage. Not documented
 /// anywhere useful. Thanks, Raymond Chen, for writing that one blog post
 /// in 2004 that saved us all. Also we have to re-set dwSize in the loop
@@ -64,22 +64,24 @@ fn snapshot_processes() -> anyhow::Result<Vec<PROCESSENTRY32W>> {
 
 /// Gets working set memory for a process. Requires PROCESS_QUERY_LIMITED_INFORMATION
 /// *and* PROCESS_VM_READ because apparently querying memory info counts as "reading
-/// virtual memory." You also have to set `cb` on the struct first or — say it with
-/// me — it silently fails. Microsoft really has ONE design pattern and it's
+/// virtual memory." You also have to set `cb` on the struct first or, say it with
+/// me, it silently fails. Microsoft really has ONE design pattern and it's
 /// "pre-initialize this field or get fucked."
 fn get_process_memory(pid: u32) -> Option<usize> {
     unsafe {
         let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ, false, pid).ok()?;
         let _guard = SafeHandle(handle);
-        let mut counters = PROCESS_MEMORY_COUNTERS::default();
-        counters.cb = std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32;
+        let mut counters = PROCESS_MEMORY_COUNTERS {
+            cb: std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32,
+            ..Default::default()
+        };
         GetProcessMemoryInfo(handle, &mut counters, counters.cb).ok()?;
         Some(counters.WorkingSetSize)
     }
 }
 
 /// Gets kernel and user CPU time for a process. Times are returned as FILETIME
-/// structs — 100-nanosecond intervals since January 1, 1601 — because nothing
+/// structs (100-nanosecond intervals since January 1, 1601) because nothing
 /// says "ergonomic API" like counting time from the year the Dutch East India
 /// Company was founded. We get to manually stitch two u32s into a u64 because
 /// this API predates 64-bit integers in Windows. Living the dream.
@@ -222,7 +224,7 @@ pub fn kill(pid: u32) -> anyhow::Result<String> {
         let handle = OpenProcess(PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION, false, pid)?;
         let _guard = SafeHandle(handle);
 
-        // Get name before killing — like reading a prisoner their charges
+        // Get name before killing, like reading a prisoner their charges
         let mut buf = vec![0u16; 260];
         let mut size = buf.len() as u32;
         let name = if QueryFullProcessImageNameW(handle, PROCESS_NAME_FORMAT(0), PWSTR(buf.as_mut_ptr()), &mut size).is_ok() {
@@ -248,7 +250,7 @@ pub fn kill(pid: u32) -> anyhow::Result<String> {
 /// It's pathological at this point.
 pub fn start(path: &str, args: Option<&str>, working_dir: Option<&str>) -> anyhow::Result<String> {
     unsafe {
-        let mut cmd_line = if let Some(a) = args {
+        let cmd_line = if let Some(a) = args {
             format!("\"{}\" {}", path, a)
         } else {
             format!("\"{}\"", path)
@@ -259,7 +261,7 @@ pub fn start(path: &str, args: Option<&str>, working_dir: Option<&str>) -> anyho
         let wd_ptr = wd_wide.as_ref().map(|w| windows::core::PCWSTR(w.as_ptr()));
 
         // Ah yes, STARTUPINFOW. cb = struct size. Say it with me now.
-        let mut si = STARTUPINFOW {
+        let si = STARTUPINFOW {
             cb: std::mem::size_of::<STARTUPINFOW>() as u32,
             ..Default::default()
         };
@@ -274,7 +276,7 @@ pub fn start(path: &str, args: Option<&str>, working_dir: Option<&str>) -> anyho
             PROCESS_CREATION_FLAGS(0),
             None,
             wd_ptr.unwrap_or(windows::core::PCWSTR::null()),
-            &mut si,
+            &si,
             &mut pi,
         )?;
 
