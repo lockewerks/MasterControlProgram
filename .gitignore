@@ -1,4 +1,4 @@
-# Rust build artifacts — nobody wants your 2GB target/ directory
+# Rust build artifacts. Nobody wants your 2GB target/ directory
 /target
 
 # Cargo.lock is committed for binaries (this is a binary, not a library)
@@ -6,7 +6,7 @@
 # Uncomment the next line if you hate reproducibility:
 # Cargo.lock
 
-# Windows debug symbols — 200MB of "where did my variable go"
+# Windows debug symbols. 200MB of "where did my variable go"
 *.pdb
 
 # IDE bullshit
