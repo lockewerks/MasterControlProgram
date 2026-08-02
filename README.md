@@ -4,7 +4,7 @@
 
 The Windows 11 system MCP server that every other MCP server wishes it was.
 
-**98 tools. 19 categories. 41 direct Win32 syscalls. Sub-millisecond response times. Full autonomous computer use.** Built in Rust because we're not here to fuck around with Node.js startup times and PowerShell's "please wait while I load the entire .NET runtime to tell you what your CPU is called."
+**98 tools. 19 categories. 37 direct Win32 syscalls. Sub-millisecond response times. Full autonomous computer use.** Built in Rust because we're not here to fuck around with Node.js startup times and PowerShell's "please wait while I load the entire .NET runtime to tell you what your CPU is called."
 
 ## Fair Warning
 
@@ -26,20 +26,20 @@ Other Windows MCP servers use PowerShell for everything and make you wait 1-2 se
 ┌─────────────────────────────────────────────────────────┐
 │  MasterControlProgram.exe (Rust binary)                 │
 │                                                         │
-│  41 tools ──→ Direct Win32 syscalls ──→ <1ms response   │
+│  37 tools ──→ Direct Win32 syscalls ──→ <1ms response   │
 │              CreateToolhelp32Snapshot, OpenSCManagerW,  │
 │              RegOpenKeyExW, GetTcpTable2, SendInput,    │
 │              BitBlt (screen capture), etc.              │
 │                                                         │
-│  57 tools ──→ Persistent PowerShell pool ──→ 200-1500ms │
+│  61 tools ──→ Persistent PowerShell pool ──→ 200-1500ms │
 │              3x pre-warmed pwsh.exe processes           │
 │              (for COM-only APIs Win32 can't touch)      │
 └─────────────────────────────────────────────────────────┘
 ```
 
-**Native Win32 tools (41):** Process management, services, registry, filesystem, network connections, system info, clipboard, disk info, **screen capture, mouse control, keyboard input**, all via direct syscalls. No subprocess. No serialization overhead. Just raw speed.
+**Native Win32 tools (37):** Process management, services, registry, filesystem, network connections, system info, clipboard, disk info, **screen capture, mouse control, keyboard input**, all via direct syscalls. No subprocess. No serialization overhead. Just raw speed.
 
-**PowerShell pool tools (57):** Firewall rules, scheduled tasks, event logs, user management, Windows features, audio, updates. All stuck behind COM/WMI interfaces that only PowerShell can reach without losing your mind. The pool keeps 3 `pwsh.exe` processes warm so at least you're not paying the startup tax every single call.
+**PowerShell pool tools (61):** Firewall rules, scheduled tasks, event logs, user management, Windows features, audio, updates. All stuck behind COM/WMI interfaces that only PowerShell can reach without losing your mind. The pool keeps 3 `pwsh.exe` processes warm so at least you're not paying the startup tax every single call.
 
 ## The 98 Tools
 
@@ -106,7 +106,7 @@ and re-running is the normal way to pick up a rebuild. `-SkipBuild` installs
 whatever is already sitting in `target\`.
 
 To build without installing, `cargo build --release` drops the binary at
-`target/release/MasterControlProgram.exe` (4.3MB, stripped, LTO'd). Registering
+`target/release/MasterControlProgram.exe` (4.4MB, stripped, LTO'd). Registering
 that path directly works fine right up until cargo tries to overwrite a binary
 your client has open, at which point every rebuild fails until you disconnect.
 Use the installer.
@@ -236,7 +236,7 @@ Measured on AMD Ryzen AI 9 HX 370, Windows 11 Pro:
 | `eventlog_query` | PowerShell | ~1,250ms |
 | `firewall_rules_list` | PowerShell | ~1,500ms |
 
-Native tools are **100-1000x faster** than PowerShell-backed tools. The 41 native tools cover the most commonly used operations plus full computer use. The 57 PowerShell tools handle the COM/WMI-only operations that would require 10x the code to implement natively, and we will get to them eventually, probably, when the rage builds back up.
+Native tools are **100-1000x faster** than PowerShell-backed tools. The 37 native tools cover the most commonly used operations plus full computer use. The 61 PowerShell tools handle the COM/WMI-only operations that would require 10x the code to implement natively, and we will get to them eventually, probably, when the rage builds back up.
 
 ## Why "MasterControlProgram"?
 
@@ -256,4 +256,4 @@ So we wrote it in Rust with direct Win32 syscalls, because we have standards and
 
 ## Contributing
 
-PRs welcome. If you migrate one of the 57 PowerShell tools to native Win32, you are a hero and we will buy you a beer. If you want to add a new tool, go for it, just put it in the right category in `server.rs` and the tool router will pick it up automatically.
+PRs welcome. If you migrate one of the 61 PowerShell tools to native Win32, you are a hero and we will buy you a beer. If you want to add a new tool, go for it, just put it in the right category in `server.rs` and the tool router will pick it up automatically.
