@@ -16,7 +16,29 @@
 //! That's two separate commands. The `catch` becomes "catch: command not found."
 //! Everything must be ONE. SINGLE. LINE. I lost hours of my life to this.
 //! Microsoft, if you're reading this: what the fuck.
+//!
+//! ## Why the command is base64'd:
+//!
+//! The single-line rule applies to the caller's command too, and callers send
+//! multi-line scripts constantly. Splicing raw text into the wrapper left the
+//! braces unclosed on line 1, so PowerShell sat there waiting for the block to
+//! close and swallowed the delimiter line as part of the pending script. The
+//! delimiter never came back, every such call burned the full timeout, and the
+//! worker was left mid-statement forever. So we base64 the command and rebuild
+//! it inside the wrapper with [ScriptBlock]::Create. The wire format is one
+//! line no matter what, and the caller's script gets parsed as a whole script
+//! instead of being chopped into independent lines.
+//!
+//! ## Why a failed exec recycles the worker:
+//!
+//! If we did not read our delimiter, we do not know where the stream is. The
+//! response may still be in flight and would be read as the *next* command's
+//! output, leaving the worker permanently off by one. A hung pwsh is also
+//! still a live process, so try_wait() reports it healthy and it would stay in
+//! rotation forever. Any exec error therefore kills and respawns the worker.
 
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as BASE64;
 use std::process::Stdio;
 use std::time::Instant;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -34,6 +56,9 @@ struct Worker {
     stdin: ChildStdin,
     stdout: BufReader<ChildStdout>,
     child: Child,
+    /// False once an exec failed without reading our delimiter. The process may
+    /// still be running, but its stdout position is no longer trustworthy.
+    healthy: bool,
 }
 
 impl Worker {
@@ -77,7 +102,7 @@ impl Worker {
             }
         });
 
-        let mut worker = Worker { id, stdin, stdout, child };
+        let mut worker = Worker { id, stdin, stdout, child, healthy: true };
 
         // Warmup: poke the process to make sure it's actually alive and not
         // just sitting there like a zombie pretending to have a stdout pipe.
@@ -112,14 +137,19 @@ impl Worker {
         // @() forces array context so .Count always works.
         // ConvertTo-Json -Compress because we're not animals (and multiline JSON
         // would break our line-based delimiter detection).
+        //
+        // The caller's command rides in as base64 and gets rebuilt with
+        // [ScriptBlock]::Create, so newlines, quotes, and unbalanced braces in
+        // the caller's script can never break the wrapper open. See module docs.
+        let encoded = BASE64.encode(command.as_bytes());
         let wrapped = format!(
-            "try {{ $__r = @( & {{ {cmd} }} ); \
+            "try {{ $__r = @( & ([ScriptBlock]::Create([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{b64}')))) ); \
              if ($__r.Count -eq 0) {{ Write-Output '{{\"s\":true,\"d\":null}}' }} \
              elseif ($__r.Count -eq 1) {{ Write-Output (@{{s=$true;d=$__r[0]}} | ConvertTo-Json -Compress -Depth 10) }} \
              else {{ Write-Output (@{{s=$true;d=$__r}} | ConvertTo-Json -Compress -Depth 10) }} \
              }} catch {{ Write-Output (@{{s=$false;e=$_.Exception.Message}} | ConvertTo-Json -Compress) }}\n\
              Write-Output '{delim}'\n",
-            cmd = command,
+            b64 = encoded,
             delim = delimiter,
         );
 
@@ -149,10 +179,19 @@ impl Worker {
             Ok::<(), anyhow::Error>(())
         });
 
-        match deadline.await {
+        let outcome = deadline.await;
+
+        // Any path that did not consume our delimiter leaves the stream at an
+        // unknown position, so the worker is burnt. Mark it and let the pool
+        // recycle it rather than handing the desync to the next caller.
+        match outcome {
             Ok(Ok(())) => Ok(result.trim().to_string()),
-            Ok(Err(e)) => Err(e),
+            Ok(Err(e)) => {
+                self.healthy = false;
+                Err(e)
+            }
             Err(_) => {
+                self.healthy = false;
                 tracing::error!(worker = self.id, "command timed out after {}s", TIMEOUT_SECS);
                 Err(anyhow::anyhow!("Command timed out after {TIMEOUT_SECS}s"))
             }
@@ -204,13 +243,22 @@ impl Pool {
         let worker_lock = self.get_worker().await;
         let mut worker = worker_lock.lock().await;
 
-        // Necromancy: if the worker died, bring it back from the dead
-        if !worker.is_alive().await {
-            tracing::warn!(worker = worker.id, "worker dead, respawning");
+        // Necromancy: dead process, or alive but with a stream we can no longer
+        // locate. Both get a fresh pwsh. Dropping the old Worker takes the old
+        // process with it via kill_on_drop.
+        if !worker.healthy || !worker.is_alive().await {
+            let reason = if worker.healthy { "process exited" } else { "stream desynced by earlier failure" };
+            tracing::warn!(worker = worker.id, reason, "respawning worker");
             *worker = Worker::spawn(worker.id).await?;
         }
 
-        let cmd_preview: String = command.chars().take(80).collect();
+        // Flatten newlines so one exec stays one log line. Multi-line commands
+        // used to smear the preview across the log and hide what was running.
+        let cmd_preview: String = command
+            .chars()
+            .take(80)
+            .map(|c| if c == '\n' || c == '\r' { ' ' } else { c })
+            .collect();
         tracing::info!(worker = worker.id, cmd = %cmd_preview, "exec");
 
         let result = worker.execute_raw(command).await;
@@ -233,6 +281,23 @@ impl Pool {
                     err = %e,
                     "fail"
                 );
+            }
+        }
+
+        // Recycle now rather than on next use, so a poisoned pwsh does not sit
+        // on memory until this slot comes back around in the rotation. If the
+        // respawn itself fails, the unhealthy flag stands and the next caller
+        // tries again.
+        if !worker.healthy {
+            let id = worker.id;
+            match Worker::spawn(id).await {
+                Ok(fresh) => {
+                    *worker = fresh;
+                    tracing::info!(worker = id, "recycled after failed exec");
+                }
+                Err(e) => {
+                    tracing::error!(worker = id, err = %e, "respawn failed, worker stays unhealthy")
+                }
             }
         }
 
