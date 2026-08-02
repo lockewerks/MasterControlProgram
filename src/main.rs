@@ -10,6 +10,7 @@
 //! 3. Starts the MCP server and prays to the async gods
 
 mod coerce;
+mod elevate;
 mod ps;
 mod server;
 mod win32;
@@ -24,18 +25,6 @@ use windows::Win32::UI::HiDpi::{
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // Tell Windows we want real pixels, not the scaled-down fantasy version.
-    // Without this, SetCursorPos and GDI capture get virtualized coordinates
-    // on any display that isn't running at 100% scaling, so clicks land in the
-    // wrong place and screenshots come back shrunk. Per-monitor-v2 means every
-    // monitor gets its own real DPI and the virtual-screen coordinates are
-    // actual physical pixels spanning the whole desktop.
-    //
-    // Must run before any DPI-sensitive API. First line of main. No exceptions.
-    let dpi_set_result = unsafe {
-        SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2)
-    };
-
     // Dual logging: stderr for the MCP client that spawned us, and a file for
     // the poor bastard who needs to figure out why shit isn't working.
     // tail -f %TEMP%\MasterControlProgram.log  <-- you're welcome
@@ -70,6 +59,31 @@ async fn main() -> anyhow::Result<()> {
 
     tracing::info!("MasterControlProgram v{} starting", env!("CARGO_PKG_VERSION"));
     tracing::info!("log file: {}", log_path.display());
+
+    // Elevation gate. Has to clear before the PowerShell pool starts, or the
+    // unelevated wrapper spawns three pwsh workers and orphans them the instant
+    // it hands off to the elevated child. See src/elevate.rs for why this is
+    // sudo and not a manifest or ShellExecuteEx.
+    match elevate::gate()? {
+        elevate::Gate::Exit(code) => {
+            tracing::info!(code, "elevated child finished, exiting");
+            std::process::exit(code);
+        }
+        elevate::Gate::Serve => {}
+    }
+
+    // Tell Windows we want real pixels, not the scaled-down fantasy version.
+    // Without this, SetCursorPos and GDI capture get virtualized coordinates
+    // on any display that isn't running at 100% scaling, so clicks land in the
+    // wrong place and screenshots come back shrunk. Per-monitor-v2 means every
+    // monitor gets its own real DPI and the virtual-screen coordinates are
+    // actual physical pixels spanning the whole desktop.
+    //
+    // Runs before any DPI-sensitive API. Logging setup and the elevation gate
+    // above touch none of them, and the wrapper process exits without drawing.
+    let dpi_set_result = unsafe {
+        SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2)
+    };
 
     // Verify DPI awareness actually took effect. Maps the awareness enum
     // value to a human-readable label so debugging coordinate issues on
