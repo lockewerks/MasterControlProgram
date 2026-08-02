@@ -10,11 +10,14 @@
 //!   3. CreateCompatibleBitmap — make a bitmap the size of the capture
 //!   4. SelectObject — attach the bitmap to the memory DC
 //!   5. BitBlt — blast screen pixels into our bitmap
+//!   5b. DrawIconEx — paint the mouse cursor on top (GPU renders it as
+//!       a hardware overlay so BitBlt never sees it — without this step
+//!       your screenshots always look cursor-less like a haunted desktop)
 //!   6. GetDIBits — extract raw BGRA pixels from the bitmap
 //!   7. Convert BGRA → RGB (because nobody wants Windows' weirdo byte order)
 //!   8. Encode to JPEG, then base64 for MCP transport
 //!
-//! That's EIGHT steps to take a screenshot. Windows: making the simple complex
+//! NINE steps to take a screenshot. Windows: making the simple complex
 //! since 1985.
 
 use anyhow::Result;
@@ -72,6 +75,21 @@ pub fn capture(
             SRCCOPY,
         )?;
 
+        // Step 5b: Paint the mouse cursor onto the captured bitmap.
+        //
+        // The cursor is drawn by the GPU as a hardware overlay — it's not
+        // part of the desktop surface that BitBlt copies. So a "raw"
+        // screenshot is always cursor-less, which is useless for vision-
+        // driven tool loops where the model needs to see what it's pointing
+        // at. We ask Windows where the cursor is, fetch its shape, and draw
+        // it onto our memory DC before reading the pixels out.
+        //
+        // DrawIconEx handles every cursor format Windows throws at it
+        // (monochrome AND/XOR masks, color cursors, masked color cursors,
+        // animated cursor frames) so we don't have to reimplement the
+        // compositing pipeline Microsoft already wrote.
+        overlay_cursor(hdc_mem, cap_x, cap_y);
+
         // Step 6: Extract raw BGRA pixel data
         // Negative biHeight = top-down row order (what PNG expects)
         let mut bmi: BITMAPINFO = std::mem::zeroed();
@@ -128,5 +146,57 @@ pub fn capture(
 
         let b64 = STANDARD.encode(&jpeg_buf);
         Ok((b64, cap_w, cap_h))
+    }
+}
+
+/// Draw the current mouse cursor onto the given memory DC, translated into
+/// the capture's local coordinate space. Silently no-ops if the cursor is
+/// hidden or any of the querying APIs fail — a screenshot without a cursor
+/// is still a useful screenshot, no reason to fail the whole capture.
+unsafe fn overlay_cursor(hdc_mem: HDC, cap_x: i32, cap_y: i32) {
+    unsafe {
+        let mut ci: CURSORINFO = std::mem::zeroed();
+        ci.cbSize = std::mem::size_of::<CURSORINFO>() as u32;
+        if GetCursorInfo(&mut ci).is_err() {
+            return;
+        }
+        if ci.flags.0 & CURSOR_SHOWING.0 == 0 {
+            return; // cursor is hidden
+        }
+
+        // Hotspot is the pixel inside the cursor image that Windows treats
+        // as "the tip." We need it because DrawIconEx positions from the
+        // cursor image's top-left, but ptScreenPos is the hotspot location.
+        let mut icon_info: ICONINFO = std::mem::zeroed();
+        if GetIconInfo(ci.hCursor.into(), &mut icon_info).is_err() {
+            return;
+        }
+
+        // Translate from screen coordinates to capture-local coordinates,
+        // then back off by the hotspot so the tip lands on ptScreenPos.
+        let draw_x = ci.ptScreenPos.x - cap_x - icon_info.xHotspot as i32;
+        let draw_y = ci.ptScreenPos.y - cap_y - icon_info.yHotspot as i32;
+
+        let _ = DrawIconEx(
+            hdc_mem,
+            draw_x,
+            draw_y,
+            ci.hCursor.into(),
+            0, // cxWidth = 0 → natural width
+            0, // cyHeight = 0 → natural height
+            0, // istepIfAniCur — use frame 0 for static cursors
+            None, // no flicker-free brush
+            DI_NORMAL,
+        );
+
+        // GetIconInfo hands us freshly-allocated bitmaps that we own.
+        // Failing to DeleteObject them leaks GDI handles on every capture,
+        // and Windows runs out of those faster than you'd think.
+        if !icon_info.hbmMask.is_invalid() {
+            let _ = DeleteObject(icon_info.hbmMask.into());
+        }
+        if !icon_info.hbmColor.is_invalid() {
+            let _ = DeleteObject(icon_info.hbmColor.into());
+        }
     }
 }

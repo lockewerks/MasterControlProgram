@@ -51,6 +51,57 @@ fn ease_in_out(t: f64) -> f64 {
     }
 }
 
+/// Move the cursor to (x, y) in virtual-screen physical pixels via
+/// `SendInput` with `MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK`.
+///
+/// Why not `SetCursorPos`? SendInput generates real input events that flow
+/// through the full input pipeline — full-screen apps, games, anything with
+/// a mouse hook sees it as a legitimate move. SetCursorPos can be intercepted
+/// or ignored.
+///
+/// The normalization formula `n = pos * 65535 / (dim - 1)` maps (0,0) to
+/// the top-left and (dim-1, dim-1) to the bottom-right exactly — no
+/// off-by-one at the edges.
+fn send_absolute(x: i32, y: i32) -> Result<()> {
+    unsafe {
+        let origin_x = GetSystemMetrics(SM_XVIRTUALSCREEN);
+        let origin_y = GetSystemMetrics(SM_YVIRTUALSCREEN);
+        let vw = GetSystemMetrics(SM_CXVIRTUALSCREEN);
+        let vh = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+
+        if vw <= 1 || vh <= 1 {
+            anyhow::bail!("Virtual screen too small to normalize: {vw}x{vh}");
+        }
+
+        // Clamp to the virtual desktop bounds so off-screen targets don't
+        // get the cursor stuck somewhere weird.
+        let rel_x = (x - origin_x).clamp(0, vw - 1) as i64;
+        let rel_y = (y - origin_y).clamp(0, vh - 1) as i64;
+        let dx = (rel_x * 65535 / (vw - 1) as i64) as i32;
+        let dy = (rel_y * 65535 / (vh - 1) as i64) as i32;
+
+        let input = INPUT {
+            r#type: INPUT_MOUSE,
+            Anonymous: INPUT_0 {
+                mi: MOUSEINPUT {
+                    dx,
+                    dy,
+                    mouseData: 0,
+                    dwFlags: MOUSEEVENTF_ABSOLUTE
+                        | MOUSEEVENTF_VIRTUALDESK
+                        | MOUSEEVENTF_MOVE,
+                    time: 0,
+                    dwExtraInfo: 0,
+                },
+            },
+        };
+        if SendInput(&[input], size_of::<INPUT>() as i32) == 0 {
+            anyhow::bail!("SendInput (absolute move) failed");
+        }
+        Ok(())
+    }
+}
+
 /// Glide the cursor smoothly from its current position to (target_x, target_y).
 /// The movement uses ease-in-out interpolation and scales duration with distance.
 /// Watching this in real time is either beautiful or deeply unsettling,
@@ -66,7 +117,7 @@ fn glide_to(target_x: i32, target_y: i32) -> Result<()> {
 
         // Skip the theatrics for sub-pixel moves
         if dist < 2.0 {
-            SetCursorPos(target_x, target_y)?;
+            send_absolute(target_x, target_y)?;
             return Ok(());
         }
 
@@ -79,12 +130,13 @@ fn glide_to(target_x: i32, target_y: i32) -> Result<()> {
             let t = ease_in_out(i as f64 / steps as f64);
             let ix = start.x + (dx * t) as i32;
             let iy = start.y + (dy * t) as i32;
-            SetCursorPos(ix, iy)?;
+            send_absolute(ix, iy)?;
             std::thread::sleep(Duration::from_millis(GLIDE_STEP_MS));
         }
 
-        // Nail the landing — floating point can leave us 1px off
-        SetCursorPos(target_x, target_y)?;
+        // Nail the landing — floating point can leave us 1px off.
+        // SendInput absolute again guarantees the pixel is exact.
+        send_absolute(target_x, target_y)?;
         Ok(())
     }
 }
@@ -224,10 +276,10 @@ pub fn mouse_drag(
             let t = ease_in_out(i as f64 / steps as f64);
             let ix = start_x + (dx * t) as i32;
             let iy = start_y + (dy * t) as i32;
-            SetCursorPos(ix, iy)?;
+            send_absolute(ix, iy)?;
             std::thread::sleep(Duration::from_millis(GLIDE_STEP_MS));
         }
-        SetCursorPos(end_x, end_y)?;
+        send_absolute(end_x, end_y)?;
 
         std::thread::sleep(Duration::from_millis(15));
 

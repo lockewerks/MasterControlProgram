@@ -35,6 +35,7 @@ pub struct ProcessListInput {
     #[schemars(description = "Sort by: cpu, memory, name, pid (default: cpu)")]
     pub sort_by: Option<String>,
     #[schemars(description = "Max processes to return 1-500 (default: 50)")]
+    #[serde(default, deserialize_with = "crate::coerce::opt_num")]
     pub limit: Option<u32>,
     #[schemars(description = "Filter by process name substring")]
     pub filter: Option<String>,
@@ -43,6 +44,7 @@ pub struct ProcessListInput {
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct ProcessByPid {
     #[schemars(description = "Process ID")]
+    #[serde(deserialize_with = "crate::coerce::num")]
     pub pid: u32,
 }
 
@@ -95,6 +97,7 @@ pub struct FsSearchInput {
     #[schemars(description = "File name pattern (supports wildcards like *.txt)")]
     pub pattern: String,
     #[schemars(description = "Max results to return (default: 50)")]
+    #[serde(default, deserialize_with = "crate::coerce::opt_num")]
     pub limit: Option<u32>,
 }
 
@@ -142,6 +145,7 @@ pub struct RegistrySearchInput {
     #[schemars(description = "Search pattern (substring match on key/value names)")]
     pub pattern: String,
     #[schemars(description = "Max results (default: 50)")]
+    #[serde(default, deserialize_with = "crate::coerce::opt_num")]
     pub limit: Option<u32>,
 }
 
@@ -157,6 +161,7 @@ pub struct PingInput {
     #[schemars(description = "Hostname or IP address")]
     pub host: String,
     #[schemars(description = "Number of pings (default: 4)")]
+    #[serde(default, deserialize_with = "crate::coerce::opt_num")]
     pub count: Option<u32>,
 }
 
@@ -165,6 +170,7 @@ pub struct PortTestInput {
     #[schemars(description = "Hostname or IP address")]
     pub host: String,
     #[schemars(description = "Port number")]
+    #[serde(deserialize_with = "crate::coerce::num")]
     pub port: u16,
 }
 
@@ -207,14 +213,17 @@ pub struct EventLogQueryInput {
     #[schemars(description = "Log name: Application, System, Security, etc.")]
     pub log_name: String,
     #[schemars(description = "Max events to return (default: 50)")]
+    #[serde(default, deserialize_with = "crate::coerce::opt_num")]
     pub limit: Option<u32>,
     #[schemars(description = "Filter by level: Critical, Error, Warning, Information, Verbose")]
     pub level: Option<String>,
     #[schemars(description = "Filter by event source name")]
     pub source: Option<String>,
     #[schemars(description = "Filter by event ID")]
+    #[serde(default, deserialize_with = "crate::coerce::opt_num")]
     pub event_id: Option<u32>,
     #[schemars(description = "Hours to look back (default: 24)")]
+    #[serde(default, deserialize_with = "crate::coerce::opt_num")]
     pub hours: Option<u32>,
 }
 
@@ -373,12 +382,16 @@ pub struct ClipboardSetInput {
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct ScreenCaptureInput {
     #[schemars(description = "X coordinate of capture region top-left in virtual screen space (default: left edge of virtual screen, which may be negative on multi-monitor setups)")]
+    #[serde(default, deserialize_with = "crate::coerce::opt_num")]
     pub x: Option<i32>,
     #[schemars(description = "Y coordinate of capture region top-left in virtual screen space (default: top edge of virtual screen, which may be negative on multi-monitor setups)")]
+    #[serde(default, deserialize_with = "crate::coerce::opt_num")]
     pub y: Option<i32>,
     #[schemars(description = "Width of capture region in physical pixels (default: full virtual screen width across all monitors)")]
+    #[serde(default, deserialize_with = "crate::coerce::opt_num")]
     pub width: Option<u32>,
-    #[schemars(description = "Height of capture region in pixels (default: primary monitor height)")]
+    #[schemars(description = "Height of capture region in physical pixels (default: full virtual screen height across all monitors)")]
+    #[serde(default, deserialize_with = "crate::coerce::opt_num")]
     pub height: Option<u32>,
 }
 
@@ -386,42 +399,54 @@ pub struct ScreenCaptureInput {
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct MouseMoveInput {
     #[schemars(description = "Target X coordinate in virtual screen pixels (matches screen_capture coordinates exactly — can be negative for monitors left of primary)")]
+    #[serde(deserialize_with = "crate::coerce::num")]
     pub x: i32,
     #[schemars(description = "Target Y coordinate in virtual screen pixels (matches screen_capture coordinates exactly — can be negative for monitors above primary)")]
+    #[serde(deserialize_with = "crate::coerce::num")]
     pub y: i32,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct MouseClickInput {
     #[schemars(description = "X coordinate to click at in virtual screen pixels (default: current position)")]
+    #[serde(default, deserialize_with = "crate::coerce::opt_num")]
     pub x: Option<i32>,
     #[schemars(description = "Y coordinate to click at in virtual screen pixels (default: current position)")]
+    #[serde(default, deserialize_with = "crate::coerce::opt_num")]
     pub y: Option<i32>,
     #[schemars(description = "Button: left, right, or middle (default: left)")]
     pub button: Option<String>,
     #[schemars(description = "Click count: 1=single, 2=double, 3=triple (default: 1)")]
+    #[serde(default, deserialize_with = "crate::coerce::opt_num")]
     pub count: Option<u32>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct MouseScrollInput {
     #[schemars(description = "X coordinate to scroll at in virtual screen pixels (default: current position)")]
+    #[serde(default, deserialize_with = "crate::coerce::opt_num")]
     pub x: Option<i32>,
     #[schemars(description = "Y coordinate to scroll at in virtual screen pixels (default: current position)")]
+    #[serde(default, deserialize_with = "crate::coerce::opt_num")]
     pub y: Option<i32>,
     #[schemars(description = "Scroll clicks: positive=up, negative=down")]
+    #[serde(deserialize_with = "crate::coerce::num")]
     pub clicks: i32,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct MouseDragInput {
     #[schemars(description = "Start X coordinate in virtual screen pixels")]
+    #[serde(deserialize_with = "crate::coerce::num")]
     pub start_x: i32,
     #[schemars(description = "Start Y coordinate in virtual screen pixels")]
+    #[serde(deserialize_with = "crate::coerce::num")]
     pub start_y: i32,
     #[schemars(description = "End X coordinate in virtual screen pixels")]
+    #[serde(deserialize_with = "crate::coerce::num")]
     pub end_x: i32,
     #[schemars(description = "End Y coordinate in virtual screen pixels")]
+    #[serde(deserialize_with = "crate::coerce::num")]
     pub end_y: i32,
     #[schemars(description = "Button: left, right, or middle (default: left)")]
     pub button: Option<String>,
@@ -446,6 +471,7 @@ pub struct PerfTopInput {
     #[schemars(description = "Sort by: cpu or memory (default: cpu)")]
     pub sort_by: Option<String>,
     #[schemars(description = "Number of processes (default: 15)")]
+    #[serde(default, deserialize_with = "crate::coerce::opt_num")]
     pub limit: Option<u32>,
 }
 
@@ -1421,9 +1447,9 @@ impl MasterControlProgram {
 
     // ── Display & Audio (3) ──────────────────────────────────────────────
 
-    #[tool(description = "Get display/monitor info: resolution, refresh rate, color depth")]
+    #[tool(description = "Get per-monitor geometry: bounds rect (virtual screen coordinates), work area, orientation (landscape/portrait/flipped with explicit degrees), refresh rate, bit depth. Also reports the full virtual screen envelope that mouse and screen_capture coordinates live in. Native Win32 via EnumDisplayMonitors + GetMonitorInfoW + EnumDisplaySettingsW.")]
     async fn display_info(&self) -> Result<CallToolResult, McpError> {
-        ps!(self, "Get-CimInstance Win32_VideoController | Select-Object Name,VideoModeDescription,CurrentHorizontalResolution,CurrentVerticalResolution,CurrentRefreshRate,CurrentBitsPerPixel,DriverVersion,Status")
+        native!(crate::win32::display::info())
     }
 
     #[tool(description = "List audio playback and recording devices")]

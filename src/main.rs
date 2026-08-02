@@ -9,6 +9,7 @@
 //! 2. Spawns a pool of PowerShell processes like some kind of shell necromancer
 //! 3. Starts the MCP server and prays to the async gods
 
+mod coerce;
 mod ps;
 mod server;
 mod win32;
@@ -17,22 +18,23 @@ use rmcp::{ServiceExt, transport::stdio};
 use std::fs::OpenOptions;
 use tracing_subscriber::{self, EnvFilter, fmt, prelude::*};
 use windows::Win32::UI::HiDpi::{
-    DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext,
+    DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, GetAwarenessFromDpiAwarenessContext,
+    GetThreadDpiAwarenessContext, SetProcessDpiAwarenessContext,
 };
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // Tell Windows we want real pixels, not the scaled-down fantasy version.
     // Without this, SetCursorPos and GDI capture get virtualized coordinates
-    // on any display that isn't running at 100% scaling — so clicks land in
-    // the wrong place and screenshots come back shrunk. Per-monitor-v2 means
-    // every monitor gets its own real DPI and the virtual-screen coordinates
-    // are actual physical pixels spanning the whole desktop.
+    // on any display that isn't running at 100% scaling, so clicks land in the
+    // wrong place and screenshots come back shrunk. Per-monitor-v2 means every
+    // monitor gets its own real DPI and the virtual-screen coordinates are
+    // actual physical pixels spanning the whole desktop.
     //
     // Must run before any DPI-sensitive API. First line of main. No exceptions.
-    unsafe {
-        let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
-    }
+    let dpi_set_result = unsafe {
+        SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2)
+    };
 
     // Dual logging: stderr for the MCP client that spawned us, and a file for
     // the poor bastard who needs to figure out why shit isn't working.
@@ -68,6 +70,25 @@ async fn main() -> anyhow::Result<()> {
 
     tracing::info!("MasterControlProgram v{} starting", env!("CARGO_PKG_VERSION"));
     tracing::info!("log file: {}", log_path.display());
+
+    // Verify DPI awareness actually took effect. Maps the awareness enum
+    // value to a human-readable label so debugging coordinate issues on
+    // scaled displays doesn't require reading the Windows SDK.
+    let awareness_label = unsafe {
+        let ctx = GetThreadDpiAwarenessContext();
+        let awareness = GetAwarenessFromDpiAwarenessContext(ctx);
+        match awareness.0 {
+            -1 => "INVALID",
+            0 => "UNAWARE (coordinates will be virtualized, bad)",
+            1 => "SYSTEM_AWARE (single-DPI, bad for mixed-DPI multi-monitor)",
+            2 => "PER_MONITOR_AWARE (good)",
+            _ => "UNKNOWN",
+        }
+    };
+    match dpi_set_result {
+        Ok(()) => tracing::info!("DPI awareness: set PER_MONITOR_AWARE_V2, thread reports {awareness_label}"),
+        Err(e) => tracing::warn!("DPI awareness: failed to set V2 ({e}), thread reports {awareness_label}"),
+    }
 
     // You can override pool size with MCP_POOL_SIZE env var.
     // Default is 3 because three PowerShell processes is already three too many,

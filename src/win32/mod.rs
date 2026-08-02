@@ -18,6 +18,7 @@ pub mod filesystem;
 pub mod clipboard;
 pub mod screen;
 pub mod input;
+pub mod display;
 
 use windows::core::PWSTR;
 
