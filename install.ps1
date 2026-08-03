@@ -27,13 +27,19 @@
 .EXAMPLE
     .\install.ps1
     .\install.ps1 -SkipBuild
+    .\install.ps1 -SkipClaudeDesktop
+
+.PARAMETER SkipClaudeDesktop
+    Do not touch claude_desktop_config.json. By default this calls the binary's
+    own --register-claude-desktop so nobody has to hand-edit JSON.
 #>
 [CmdletBinding()]
 param(
     [string]$InstallDir    = (Join-Path $env:ProgramFiles 'MasterControlProgram'),
     [ValidateSet('release', 'debug')]
     [string]$Configuration = 'release',
-    [switch]$SkipBuild
+    [switch]$SkipBuild,
+    [switch]$SkipClaudeDesktop
 )
 
 $ErrorActionPreference = 'Stop'
@@ -138,9 +144,23 @@ $sudoLabel = switch ($sudoMode) {
 }
 Write-Note "sudo mode: $sudoLabel"
 
+# ------------------------------------------------------- Claude Desktop ----
+# The binary registers itself. Duplicating that logic here would mean two
+# implementations of the MSIX path resolution and the ACL-preserving write,
+# drifting apart the moment one of them is fixed.
+if ($SkipClaudeDesktop) {
+    Write-Step "Skipping Claude Desktop registration"
+} else {
+    Write-Step "Registering with Claude Desktop"
+    & $TargetExe --register-claude-desktop
+    if ($LASTEXITCODE -ne 0) { Write-Warning "registration exited $LASTEXITCODE" }
+}
+
 Write-Host ""
 Write-Host "Installed." -ForegroundColor Green
-Write-Host "Register with an MCP client using this path:"
 Write-Host "  $TargetExe" -ForegroundColor Yellow
 Write-Host ""
 Write-Host "It elevates itself on launch, so the client does not need to be elevated."
+if (-not $SkipClaudeDesktop) {
+    Write-Host "Fully quit and reopen Claude Desktop to pick up the change." -ForegroundColor Yellow
+}

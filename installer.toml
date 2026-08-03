@@ -1,0 +1,118 @@
+# MasterControlProgram: a Windows system-control MCP server.
+#
+# Payload is a single self-contained exe, so there is no bin/ layout here and
+# the shortcut action is deliberately absent: this is a headless stdio server
+# launched by an MCP client, not something anyone double-clicks.
+
+[product]
+name         = "MasterControlProgram"
+version      = "1.0.1"
+publisher    = "Locke Werks"
+description  = "Windows 11 system control over MCP. 98 tools, 37 direct Win32 syscalls, full computer use."
+copyright    = "Copyright (c) 2026 Locke Werks"
+url          = "https://github.com/lockewerks/MasterControlProgram"
+# Stable across versions forever. Upgrade detection and the single-instance
+# mutex key off this, so a new GUID next release turns an upgrade into a
+# second, parallel install.
+upgrade_code = "5bebe0d5-8705-4164-abd9-98be405f1895"
+aumid        = "LockeWerks.MasterControlProgram"
+
+[install]
+scope = "machine"
+dir   = '{ProgramFiles}\MasterControlProgram'
+# on-demand, not required: this product hands an AI unrestricted control of the
+# machine, and the warning below needs to be readable BEFORE a UAC prompt shows
+# up. Consent after the fact is not consent.
+elevation = "on-demand"
+
+[ui]
+warning = "This gives an AI full, unrestricted, root-level access to this machine: processes, registry, files, services, firewall, plus your screen, mouse and keyboard. There is no sandbox and no undo. Install it only if that is exactly what you want."
+license_text = """
+MIT License
+
+Copyright (c) 2026 Locke Werks
+
+Permission is hereby granted, free of charge, to any person obtaining a copy of
+this software and associated documentation files (the "Software"), to deal in
+the Software without restriction, including without limitation the rights to
+use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of
+the Software, and to permit persons to whom the Software is furnished to do so,
+subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS
+FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR
+COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER
+IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
+CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+"""
+
+# Windows 11 24H2. Not cosmetic: the server self-elevates through sudo, which
+# does not exist before this build.
+[[preflight]]
+type = "os_build"
+min  = 26100
+fail = "Windows 11 24H2 (build 26100) or later is required. The server self-elevates through sudo, which older builds do not have."
+
+# Catches the out-of-box state, where sudo has never been configured and the
+# key does not exist at all.
+#
+# It cannot check that sudo is in Inline mode specifically: registry_value only
+# tests presence or absence, so a box sitting in ForceNewWindow or DisableInput
+# passes this and then fails at first launch. The server checks the actual mode
+# on startup and refuses to run with the exact command to fix it, which is the
+# real gate. This is only here to catch the common case earlier.
+[[preflight]]
+type   = "registry_value"
+hive   = "HKLM"
+key    = 'SOFTWARE\Microsoft\Windows\CurrentVersion\Sudo'
+name   = "Enabled"
+expect = true
+fail   = "sudo is not enabled. Open an admin terminal and run: sudo config --enable normal"
+
+# No preflight for PowerShell 7, deliberately. file_exists does not expand
+# {ProgramFiles}, and hardcoding C:\Program Files would block installs on any
+# machine whose ProgramFiles is elsewhere. A check that produces a false
+# refusal is worse than no check: the server reports a missing pwsh clearly
+# enough at startup.
+
+# Replacing the exe while a client holds it open fails the copy halfway.
+[[preflight]]
+type            = "process_not_running"
+name            = "MasterControlProgram.exe"
+restart_manager = true
+fail            = "MasterControlProgram is running. Close any MCP client using it (Claude Desktop, Claude Code) and retry."
+
+[[actions]]
+type = "arp"
+quiet_uninstall = true
+
+# Registering with Claude Desktop is the entire reason this installer exists:
+# otherwise a user has to find claude_desktop_config.json and hand-edit JSON,
+# and on a Store install the path every guide gives them is the wrong one.
+#
+# The subcommand lives in the server binary rather than a helper script because
+# hooks run a payload member as argv with no shell, and because "auto" pins the
+# hook to this exact exe by digest.
+[[hooks.post_install]]
+id     = "register_claude_desktop"
+run    = 'payload:MasterControlProgram.exe'
+args   = ["--register-claude-desktop"]
+sha256 = "auto"
+expect_exit = [0]
+timeout_ms  = 30000
+# Not vital. Claude Desktop may not be installed at all, and a working install
+# of the server is still worth having for Claude Code and other MCP clients.
+vital = false
+
+[[hooks.pre_uninstall]]
+id     = "unregister_claude_desktop"
+run    = 'payload:MasterControlProgram.exe'
+args   = ["--unregister-claude-desktop"]
+sha256 = "auto"
+expect_exit = [0]
+timeout_ms  = 30000
+vital = false

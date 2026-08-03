@@ -1,6 +1,6 @@
 [package]
 name = "master-control-program"
-version = "1.0.0"
+version = "1.0.1"
 edition = "2021"
 description = "The fastest Windows 11 system control MCP server"
 
@@ -12,7 +12,10 @@ path = "src/main.rs"
 rmcp = { version = "1", features = ["server", "transport-io"] }
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+# preserve_order: we rewrite the user's claude_desktop_config.json in place.
+# Without this, serde reorders every key alphabetically and the diff looks like
+# we rewrote their whole config instead of touching one entry.
+serde_json = { version = "1", features = ["preserve_order"] }
 uuid = { version = "1", features = ["v4"] }
 base64 = "0.22"
 jpeg-encoder = "0.6"

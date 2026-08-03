@@ -9,6 +9,7 @@
 //! 2. Spawns a pool of PowerShell processes like some kind of shell necromancer
 //! 3. Starts the MCP server and prays to the async gods
 
+mod claude_desktop;
 mod coerce;
 mod elevate;
 mod ps;
@@ -25,6 +26,19 @@ use windows::Win32::UI::HiDpi::{
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // Installer hooks call these, and so can anyone who'd rather not hand-edit
+    // JSON. They run before everything else on purpose: no log file, no pwsh
+    // pool, and above all no elevation gate. A CLI subcommand that re-execs
+    // itself through sudo would sit there holding a pipe nobody is reading.
+    let args: Vec<String> = std::env::args().collect();
+    if args.iter().any(|a| a == "--register-claude-desktop") {
+        let exe = std::env::current_exe()?;
+        return claude_desktop::register(&exe);
+    }
+    if args.iter().any(|a| a == "--unregister-claude-desktop") {
+        return claude_desktop::unregister();
+    }
+
     // Dual logging: stderr for the MCP client that spawned us, and a file for
     // the poor bastard who needs to figure out why shit isn't working.
     // tail -f %TEMP%\MasterControlProgram.log  <-- you're welcome

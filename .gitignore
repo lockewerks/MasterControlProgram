@@ -27,3 +27,6 @@ Desktop.ini
 
 # Log files from our own server
 MasterControlProgram.log
+
+# Forge output: installers and staged payload
+/dist

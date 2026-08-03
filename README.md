@@ -89,7 +89,39 @@ All mouse movement uses **ease-in-out cubic interpolation**. The cursor accelera
 - **sudo for Windows in Inline mode**, see [Elevation](#elevation-or-how-we-stopped-asking-nicely)
 - **Rust** (`winget install Rustlang.Rustup`), only needed to build from source
 
-### Build and install
+### Install
+
+Grab `MasterControlProgram-Setup.exe` from
+[Releases](https://github.com/lockewerks/MasterControlProgram/releases) and run
+it. Installer, uninstaller, and the server binary are all Authenticode-signed.
+
+It checks the things that otherwise fail confusingly later (Windows build, sudo
+enabled, nothing holding the exe open), installs to
+`%ProgramFiles%\MasterControlProgram`, and **registers itself with Claude
+Desktop**, so nobody has to go find `claude_desktop_config.json` and hand-edit
+JSON. Uninstalling removes the entry again and leaves your other MCP servers
+alone.
+
+Silent install for deployment: `MasterControlProgram-Setup.exe /S`. Preflight
+without installing anything: `--check-only`. Exit codes follow the MSI
+convention (0 success, 1603 a requirement not met, 1618 already running).
+
+If you'd rather wire it up yourself, the binary can do just the registration
+step:
+
+```powershell
+MasterControlProgram.exe --register-claude-desktop
+MasterControlProgram.exe --unregister-claude-desktop
+```
+
+That handles the part everyone gets wrong: on a Microsoft Store install of
+Claude Desktop, the config path every guide gives you is **not** the file the
+app reads. Writes to `%APPDATA%\Claude\` land in a stale orphan while the live
+config sits inside the package container under `%LOCALAPPDATA%\Packages\`. It
+also rewrites the file in place rather than replacing it, so an elevated
+installer doesn't leave a root-owned config in your user profile.
+
+### Build from source
 
 ```bash
 git clone https://github.com/lockewerks/MasterControlProgram.git
@@ -100,18 +132,21 @@ cd MasterControlProgram
 .\install.ps1
 ```
 
-Builds, murders any running instance, and installs to
-`%ProgramFiles%\MasterControlProgram\MasterControlProgram.exe`. Safe to re-run,
-and re-running is the normal way to pick up a rebuild. `-SkipBuild` installs
-whatever is already sitting in `target\`.
+The dev loop: builds, murders any running instance, installs, and registers
+with Claude Desktop. Safe to re-run, which is how you pick up a rebuild.
+`-SkipBuild` installs whatever is already in `target\`, `-SkipClaudeDesktop`
+leaves the config alone.
 
-To build without installing, `cargo build --release` drops the binary at
+`cargo build --release` alone drops the binary at
 `target/release/MasterControlProgram.exe` (4.4MB, stripped, LTO'd). Registering
-that path directly works fine right up until cargo tries to overwrite a binary
-your client has open, at which point every rebuild fails until you disconnect.
-Use the installer.
+that path directly works right up until cargo tries to overwrite a binary your
+client has open, at which point every rebuild fails until you disconnect. Use
+the installer.
 
-**On signatures:** binaries attached to [GitHub Releases](https://github.com/lockewerks/MasterControlProgram/releases) are Authenticode-signed by CI. Anything you build yourself is not, and the installer will not sign it for you, because it is not our certificate to hand out. If you want your own local builds signed, bring your own Trusted Signing account and point `scripts\sign.ps1` at it. If you'd rather not think about it, grab the release binary and move on with your life.
+**On signatures:** release artifacts are signed with our certificate. Anything
+you build yourself is not, and nothing here will sign it for you, because that
+certificate is not ours to hand out. Bring your own Trusted Signing account and
+point `scripts\sign.ps1` at it, or just take the release build.
 
 ### Elevation (or: how we stopped asking nicely)
 
