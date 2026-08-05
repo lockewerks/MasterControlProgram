@@ -18,6 +18,11 @@ The Windows 11 system MCP server that every other MCP server wishes it was.
 
 An [MCP (Model Context Protocol)](https://modelcontextprotocol.io) server that gives AI assistants **full system control** over Windows 11. Not just system management, but **full autonomous computer use**. Screen capture, mouse control, keyboard input, plus processes, services, registry, firewall, network, the whole goddamn operating system.
 
+It runs under any MCP client that can launch a local stdio server, and it writes
+itself into the two that need a config file edited: Claude Desktop, and the
+OpenAI Codex host behind the ChatGPT desktop app, the Codex CLI and the Codex
+IDE extension. See [Install](#install).
+
 Other Windows MCP servers use PowerShell for everything and make you wait 1-2 seconds per tool call. We call Win32 APIs directly from Rust. Our `process_list` runs in **9ms**. Our `memory_info` runs in **<1ms**. Their equivalent takes **1,500ms**. Do the math, then go look at what your current server is doing with that second and a half.
 
 ## Architecture (or: Why This Is Fast)
