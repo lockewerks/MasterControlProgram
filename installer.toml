@@ -6,7 +6,7 @@
 
 [product]
 name         = "MasterControlProgram"
-version      = "1.0.1"
+version      = "1.1.0"
 publisher    = "Locke Werks"
 description  = "Windows 11 system control over MCP. 98 tools, 37 direct Win32 syscalls, full computer use."
 copyright    = "Copyright (c) 2026 Locke Werks"
@@ -90,28 +90,36 @@ fail            = "MasterControlProgram is running. Close any MCP client using i
 type = "arp"
 quiet_uninstall = true
 
-# Registering with Claude Desktop is the entire reason this installer exists:
-# otherwise a user has to find claude_desktop_config.json and hand-edit JSON,
-# and on a Store install the path every guide gives them is the wrong one.
+# Client registration is the entire reason this installer exists: otherwise a
+# user has to find a config file and hand-edit it, and on a Store install of
+# Claude Desktop the path every guide gives them is the wrong one.
+#
+# Two clients are covered: Claude Desktop, and the shared Codex config that the
+# ChatGPT desktop app, the Codex CLI and the Codex IDE extension all read.
+#
+# Bare --register takes whichever of them are on the box, which is the only
+# form available here. Forge has no options page and hook args are fixed at
+# build time, so there is no checkbox to read: the binary decides at run time,
+# and prints what it skipped along with the flag to add it by hand later.
 #
 # The subcommand lives in the server binary rather than a helper script because
 # hooks run a payload member as argv with no shell, and because "auto" pins the
 # hook to this exact exe by digest.
 [[hooks.post_install]]
-id     = "register_claude_desktop"
+id     = "register_mcp_clients"
 run    = 'payload:MasterControlProgram.exe'
-args   = ["--register-claude-desktop"]
+args   = ["--register"]
 sha256 = "auto"
 expect_exit = [0]
 timeout_ms  = 30000
-# Not vital. Claude Desktop may not be installed at all, and a working install
-# of the server is still worth having for Claude Code and other MCP clients.
+# Not vital. Neither client may be installed at all, and a working install of
+# the server is still worth having for Claude Code and other MCP clients.
 vital = false
 
 [[hooks.pre_uninstall]]
-id     = "unregister_claude_desktop"
+id     = "unregister_mcp_clients"
 run    = 'payload:MasterControlProgram.exe'
-args   = ["--unregister-claude-desktop"]
+args   = ["--unregister"]
 sha256 = "auto"
 expect_exit = [0]
 timeout_ms  = 30000

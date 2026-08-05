@@ -82,6 +82,13 @@ pub fn config_path() -> Option<(PathBuf, &'static str)> {
     None
 }
 
+/// Whether Claude Desktop is on the box. Presence of the config directory is
+/// the only honest test: both install flavours create it, and neither writes
+/// anything we could look for before the app has run once.
+pub fn installed() -> bool {
+    config_path().is_some()
+}
+
 /// Parse the existing config, or start a fresh object if there isn't one.
 /// A config that exists but is corrupt is a hard error: silently replacing it
 /// would take out every other server the user has configured.
@@ -139,7 +146,14 @@ pub fn register(exe: &Path) -> Result<()> {
         // Not an error. Plenty of people run this from Claude Code and have
         // never installed the desktop app; failing the install over it would
         // be obnoxious.
-        println!("Claude Desktop not found, skipping registration.");
+        //
+        // We do not create the file either, even when the user names this
+        // client explicitly. Which of the two paths is live depends on which
+        // install flavour is present, and with neither present there is nothing
+        // to read the answer off. Guessing wrong writes the stale orphan the
+        // module docs are about: a file that looks right and is read by nobody.
+        println!("Not found, skipping registration.");
+        println!("Install it, then re-run: --register-claude-desktop");
         return Ok(());
     };
     println!("config ({kind}): {}", path.display());
@@ -181,9 +195,11 @@ pub fn register(exe: &Path) -> Result<()> {
 /// Remove our entry, leaving everything else alone.
 pub fn unregister() -> Result<()> {
     let Some((path, kind)) = config_path() else {
+        println!("not found, nothing to remove");
         return Ok(());
     };
     if !path.exists() {
+        println!("no config at {}, nothing to remove", path.display());
         return Ok(());
     }
     println!("config ({kind}): {}", path.display());

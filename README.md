@@ -97,29 +97,50 @@ it. Installer, uninstaller, and the server binary are all Authenticode-signed.
 
 It checks the things that otherwise fail confusingly later (Windows build, sudo
 enabled, nothing holding the exe open), installs to
-`%ProgramFiles%\MasterControlProgram`, and **registers itself with Claude
-Desktop**, so nobody has to go find `claude_desktop_config.json` and hand-edit
-JSON. Uninstalling removes the entry again and leaves your other MCP servers
-alone.
+`%ProgramFiles%\MasterControlProgram`, and **registers itself with every
+supported MCP client it finds**, so nobody has to go find a config file and
+hand-edit it. Uninstalling removes the entries again and leaves your other MCP
+servers alone.
+
+| Client | Config it writes |
+|---|---|
+| Claude Desktop | `claude_desktop_config.json`, wherever that actually lives |
+| ChatGPT desktop, Codex CLI, Codex IDE extension | `%USERPROFILE%\.codex\config.toml` |
+
+The three OpenAI clients are one Codex host underneath and share a single MCP
+config, so one entry covers all three.
 
 Silent install for deployment: `MasterControlProgram-Setup.exe /S`. Preflight
 without installing anything: `--check-only`. Exit codes follow the MSI
 convention (0 success, 1603 a requirement not met, 1618 already running).
 
-If you'd rather wire it up yourself, the binary can do just the registration
-step:
+If you'd rather pick, or you installed a client afterwards, the binary does the
+registration on its own:
 
 ```powershell
-MasterControlProgram.exe --register-claude-desktop
-MasterControlProgram.exe --unregister-claude-desktop
+MasterControlProgram.exe --register                 # everything installed
+MasterControlProgram.exe --register-claude-desktop  # Claude Desktop
+MasterControlProgram.exe --register-chatgpt         # ChatGPT / Codex
+MasterControlProgram.exe --register-claude-desktop --register-chatgpt   # both
 ```
 
-That handles the part everyone gets wrong: on a Microsoft Store install of
-Claude Desktop, the config path every guide gives you is **not** the file the
-app reads. Writes to `%APPDATA%\Claude\` land in a stale orphan while the live
-config sits inside the package container under `%LOCALAPPDATA%\Packages\`. It
-also rewrites the file in place rather than replacing it, so an elevated
-installer doesn't leave a root-owned config in your user profile.
+Each has an `--unregister` twin, and bare `--unregister` sweeps every client.
+Naming a client writes its config whether or not that client is installed;
+bare `--register` skips what it can't find and prints the flag to add it later.
+
+It handles the part everyone gets wrong. On a Microsoft Store install of Claude
+Desktop, the config path every guide gives you is **not** the file the app
+reads: writes to `%APPDATA%\Claude\` land in a stale orphan while the live
+config sits inside the package container under `%LOCALAPPDATA%\Packages\`. The
+Codex side is TOML that holds your model settings, approval policy and project
+trust, so it's merged with `toml_edit` rather than re-serialized, and your
+comments and formatting survive. Both files are rewritten in place rather than
+replaced, so an elevated installer doesn't leave a root-owned config in your
+user profile.
+
+The Codex entry also asks for a 60 second `startup_timeout_sec`. The default is
+10, and the handshake sits behind a UAC prompt, which is not a race worth
+losing.
 
 ### Build from source
 
@@ -132,10 +153,10 @@ cd MasterControlProgram
 .\install.ps1
 ```
 
-The dev loop: builds, murders any running instance, installs, and registers
-with Claude Desktop. Safe to re-run, which is how you pick up a rebuild.
-`-SkipBuild` installs whatever is already in `target\`, `-SkipClaudeDesktop`
-leaves the config alone.
+The dev loop: builds, murders any running instance, installs, and registers with
+whichever clients are installed. Safe to re-run, which is how you pick up a
+rebuild. `-SkipBuild` installs whatever is already in `target\`, and `-Clients`
+takes `auto` (default), `claude`, `chatgpt`, `both`, or `none`.
 
 `cargo build --release` alone drops the binary at
 `target/release/MasterControlProgram.exe` (4.4MB, stripped, LTO'd). Registering
@@ -198,23 +219,11 @@ a screen door. Still worth knowing before you enable it for unrelated reasons.
 
 ### Add to your MCP client
 
-Most MCP clients use a JSON config file. Add MasterControlProgram as a server:
+Claude Desktop and the OpenAI clients register themselves, see
+[Install](#install). For anything else, it's one entry in that client's config.
 
-**Settings file** (e.g. `settings.json`, `mcp_config.json`, etc.):
-
-```json
-{
-  "mcpServers": {
-    "MasterControlProgram": {
-      "command": "C:\\Program Files\\MasterControlProgram\\MasterControlProgram.exe"
-    }
-  }
-}
-```
-
-### Desktop app config
-
-For desktop MCP apps, the config is usually at `%APPDATA%\<app>\config.json`:
+Most of them use JSON, in a `settings.json`, an `mcp_config.json`, or something
+under `%APPDATA%`, take your pick:
 
 ```json
 {
@@ -225,6 +234,19 @@ For desktop MCP apps, the config is usually at `%APPDATA%\<app>\config.json`:
   }
 }
 ```
+
+The Codex host (ChatGPT desktop, Codex CLI, Codex IDE extension) uses TOML at
+`%USERPROFILE%\.codex\config.toml`:
+
+```toml
+[mcp_servers.mastercontrolprogram]
+command = 'C:\Program Files\MasterControlProgram\MasterControlProgram.exe'
+startup_timeout_sec = 60
+```
+
+Note the single quotes. Double quotes make it a TOML basic string, where every
+backslash starts an escape, so a Windows path either fails to parse or quietly
+becomes a different path. Single quotes take it literally.
 
 ## Monitoring
 

@@ -24,14 +24,24 @@
 .PARAMETER SkipBuild
     Install whatever is already in target\, without invoking cargo.
 
+.PARAMETER Clients
+    Which MCP clients to register with. The binary does the writing, so this
+    only picks the flag:
+
+      auto     whichever clients are installed (default)
+      claude   Claude Desktop
+      chatgpt  ChatGPT desktop, Codex CLI, Codex IDE extension (one shared file)
+      both     Claude Desktop and ChatGPT, whether or not they are installed
+      none     leave every config alone
+
+    Naming a client writes its config even when that client is not installed
+    yet. auto skips what it cannot find and tells you how to add it later.
+
 .EXAMPLE
     .\install.ps1
     .\install.ps1 -SkipBuild
-    .\install.ps1 -SkipClaudeDesktop
-
-.PARAMETER SkipClaudeDesktop
-    Do not touch claude_desktop_config.json. By default this calls the binary's
-    own --register-claude-desktop so nobody has to hand-edit JSON.
+    .\install.ps1 -Clients both
+    .\install.ps1 -Clients none
 #>
 [CmdletBinding()]
 param(
@@ -39,7 +49,8 @@ param(
     [ValidateSet('release', 'debug')]
     [string]$Configuration = 'release',
     [switch]$SkipBuild,
-    [switch]$SkipClaudeDesktop
+    [ValidateSet('auto', 'claude', 'chatgpt', 'both', 'none')]
+    [string]$Clients = 'auto'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -144,15 +155,28 @@ $sudoLabel = switch ($sudoMode) {
 }
 Write-Note "sudo mode: $sudoLabel"
 
-# ------------------------------------------------------- Claude Desktop ----
+# ----------------------------------------------------------- MCP clients ----
 # The binary registers itself. Duplicating that logic here would mean two
-# implementations of the MSIX path resolution and the ACL-preserving write,
-# drifting apart the moment one of them is fixed.
-if ($SkipClaudeDesktop) {
-    Write-Step "Skipping Claude Desktop registration"
+# implementations of the MSIX path resolution, the TOML merge and the
+# ACL-preserving writes, drifting apart the moment one of them is fixed.
+#
+# Assigning inside the switch rather than letting it emit: a switch branch that
+# outputs an empty array emits nothing at all, so `none` would leave the
+# variable null and strict mode would take the .Count below personally.
+$registerArgs = @()
+switch ($Clients) {
+    'auto'    { $registerArgs = @('--register') }
+    'claude'  { $registerArgs = @('--register-claude-desktop') }
+    'chatgpt' { $registerArgs = @('--register-chatgpt') }
+    'both'    { $registerArgs = @('--register-claude-desktop', '--register-chatgpt') }
+    'none'    { }
+}
+
+if ($registerArgs.Count -eq 0) {
+    Write-Step "Skipping client registration"
 } else {
-    Write-Step "Registering with Claude Desktop"
-    & $TargetExe --register-claude-desktop
+    Write-Step "Registering with MCP clients ($Clients)"
+    & $TargetExe @registerArgs
     if ($LASTEXITCODE -ne 0) { Write-Warning "registration exited $LASTEXITCODE" }
 }
 
@@ -161,6 +185,6 @@ Write-Host "Installed." -ForegroundColor Green
 Write-Host "  $TargetExe" -ForegroundColor Yellow
 Write-Host ""
 Write-Host "It elevates itself on launch, so the client does not need to be elevated."
-if (-not $SkipClaudeDesktop) {
-    Write-Host "Fully quit and reopen Claude Desktop to pick up the change." -ForegroundColor Yellow
+if ($registerArgs.Count -gt 0) {
+    Write-Host "Fully quit and reopen anything it registered with to pick up the change." -ForegroundColor Yellow
 }

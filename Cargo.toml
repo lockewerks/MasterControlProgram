@@ -1,6 +1,6 @@
 [package]
 name = "master-control-program"
-version = "1.0.1"
+version = "1.1.0"
 edition = "2021"
 description = "The fastest Windows 11 system control MCP server"
 
@@ -16,6 +16,11 @@ serde = { version = "1", features = ["derive"] }
 # Without this, serde reorders every key alphabetically and the diff looks like
 # we rewrote their whole config instead of touching one entry.
 serde_json = { version = "1", features = ["preserve_order"] }
+# The OpenAI clients keep their MCP servers in TOML, and that file is the user's:
+# model settings, approval policy, per-project trust, and their own comments.
+# toml_edit rewrites one table and leaves the rest of the document byte for byte,
+# which a serde round-trip through `toml` cannot do.
+toml_edit = "0.25"
 uuid = { version = "1", features = ["v4"] }
 base64 = "0.22"
 jpeg-encoder = "0.6"
