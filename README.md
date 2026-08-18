@@ -1,4 +1,18 @@
+<div align="center">
+
+<img src="assets/mastercontrolprogram.ico" width="96" alt="MasterControlProgram">
+
 # MasterControlProgram
+
+**The Windows 11 system MCP server that every other MCP server wishes it was.**
+
+[![release](https://img.shields.io/github/v/release/lockewerks/MasterControlProgram?style=flat-square&color=d6262a)](https://github.com/lockewerks/MasterControlProgram/releases)
+[![license](https://img.shields.io/badge/license-MIT-d6262a?style=flat-square)](LICENSE)
+![platform](https://img.shields.io/badge/platform-Windows%2011-d6262a?style=flat-square)
+
+</div>
+
+---
 
 > *"End of line."*
 
