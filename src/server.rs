@@ -1526,19 +1526,15 @@ impl MasterControlProgram {
         let start = std::time::Instant::now();
         tracing::info!(tool = "screen_capture", "▶ native");
 
-        // Capture first, glow second, deliberately. A red border baked into the
-        // JPEG is a hallucination we manufactured, in the one tool whose whole
-        // job is to be believed. The overlay sets WDA_EXCLUDEFROMCAPTURE and
-        // refuses to run if Windows will not grant it, so this should be belt
-        // and braces, but the ordering is free and does not depend on being
-        // right about that. It is not sufficient on its own either: the loop
-        // this tool lives in is click, screenshot, click, so the glow is
-        // usually already lit from the previous call by the time we get here.
-        // Both halves are load-bearing.
-        let captured = crate::win32::screen::capture(input.x, input.y, input.width, input.height);
-        crate::overlay::pulse();
-
-        match captured {
+        // Deliberately does not pulse the activity glow, unlike the mouse and
+        // keyboard tools. Keeping the glow out of a capture used to rely on
+        // WDA_EXCLUDEFROMCAPTURE, which turns out to hide the window from the
+        // human too on a virtual or indirect display, so the indicator was
+        // perfect and invisible. Not lighting it here means a screenshot on its
+        // own comes back clean with no help from Windows, and the overlay can
+        // stay visible where it matters. A screenshot taken while the glow is
+        // still up from a click or a keystroke will still contain it.
+        match crate::win32::screen::capture(input.x, input.y, input.width, input.height) {
             Ok((b64, w, h)) => {
                 let ms = start.elapsed().as_millis();
                 tracing::info!(tool = "screen_capture", ms = ms as u64, "✓ native done");

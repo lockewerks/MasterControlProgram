@@ -32,14 +32,26 @@
 //! the glow is supposed to be animating. So the overlay gets a dedicated OS
 //! thread, and the tool handlers reach it with a single `PostMessageW`.
 //!
-//! ## Why it never appears in a screenshot
+//! ## Screenshots
 //!
-//! `win32::screen::capture` BitBlts the screen DC. Left alone, every JPEG we
-//! hand back would have a red border the model did not put there, in the one
-//! tool whose entire job is to be believed. `SetWindowDisplayAffinity` with
-//! `WDA_EXCLUDEFROMCAPTURE` is what keeps us out of it. If that call fails we
-//! do not run at all: a glow that contaminates the model's view of the machine
-//! is worse than no glow.
+//! `screen_capture` does not light the glow, so a screenshot on its own comes
+//! back clean. A screenshot taken while the glow is still lit from a click or a
+//! keystroke will contain it.
+//!
+//! This started out using `SetWindowDisplayAffinity(WDA_EXCLUDEFROMCAPTURE)` to
+//! keep out of captures unconditionally, and that was a mistake worth recording.
+//! The flag is meant to keep a window on the physical display while removing it
+//! from every capture path. On a desktop served by an indirect or virtual
+//! display driver there is no physical path left to keep it on, so the window is
+//! withheld from the panel too, and the glow becomes something that renders
+//! perfectly and that nobody can ever see.
+//!
+//! The trap is that the same flag hides the window from every screenshot, so
+//! "correctly excluded" and "not drawing at all" produce byte-identical
+//! captures. No software instrument on the machine can separate them. It took a
+//! person looking at their own screen to notice, which is what `src/spike.rs`
+//! exists for. `MCP_OVERLAY_AFFINITY=exclude` opts back in on hardware where it
+//! genuinely works.
 
 use std::sync::atomic::{AtomicIsize, Ordering};
 use std::sync::mpsc;
@@ -760,16 +772,22 @@ unsafe fn create(peak: f64) -> anyhow::Result<Glow> {
         )
         .map_err(|e| anyhow::anyhow!("CreateWindowExW failed: {e}"))?;
 
-        // The one hard requirement. Without this the glow is baked into every
-        // screenshot the model reads back, which corrupts its picture of the
-        // machine in a way that is worse than having no indicator at all. So if
-        // Windows will not promise to keep us out of captures, we do not run.
-        if let Err(e) = SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE) {
-            let _ = DestroyWindow(hwnd);
-            anyhow::bail!(
-                "SetWindowDisplayAffinity rejected WDA_EXCLUDEFROMCAPTURE ({e}), \
-                 refusing to run rather than risk a red border in screen_capture"
-            );
+        // Off by default. See the module docs: this flag makes the window
+        // invisible to the human as well as to captures whenever the desktop is
+        // served by an indirect or virtual display driver, and there is no way
+        // to detect that from inside the process, because the failure and the
+        // success look identical to every screenshot we could take.
+        //
+        // `screen_capture` no longer lights the glow, so a screenshot on its own
+        // is clean without any help from Windows.
+        if std::env::var("MCP_OVERLAY_AFFINITY").as_deref() == Ok("exclude") {
+            match SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE) {
+                Ok(()) => tracing::info!("activity glow: excluded from screen capture"),
+                Err(e) => tracing::warn!(
+                    err = %e,
+                    "activity glow: capture exclusion refused, carrying on without it"
+                ),
+            }
         }
 
         Ok(Glow {

@@ -15,6 +15,7 @@ mod elevate;
 mod overlay;
 mod ps;
 mod server;
+mod spike;
 mod win32;
 
 use rmcp::{ServiceExt, transport::stdio};
@@ -41,6 +42,13 @@ async fn main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().collect();
     if let Some(action) = clients::Action::from_args(&args) {
         return action.and_then(clients::Action::run);
+    }
+
+    // Visual proof-of-life for the activity glow, ahead of the elevation gate
+    // and the pwsh pool because it needs neither: it draws and exits. See
+    // src/spike.rs for why a human has to be the one looking.
+    if args.iter().any(|a| a == spike::FLAG) {
+        return spike::run();
     }
 
     // Dual logging: stderr for the MCP client that spawned us, and a file for
