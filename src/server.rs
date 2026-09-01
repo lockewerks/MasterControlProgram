@@ -567,6 +567,28 @@ macro_rules! native {
     }};
 }
 
+/// `native!`, plus a pulse of the activity glow before the call.
+///
+/// Reach for this instead of `native!` on any tool that drives the machine at
+/// the seat: injects input, changes what the human's next keystroke does, or
+/// photographs the screen. The glow is the only signal that reaches someone
+/// who is looking at their desktop rather than at the client window, so which
+/// of the two macros you type here is the entire policy. Passive reads stay on
+/// `native!`: `cursor_position` gets polled in a tight loop and a light that is
+/// always on says nothing.
+///
+/// Delegates rather than duplicating, and does so in a plain block on purpose.
+/// `native!` works out the tool name from `type_name` of a local `fn f()`,
+/// which survives any number of macro layers and plain blocks because neither
+/// adds a path segment. A closure, an `async` block or a nested `fn` would add
+/// one, and all 41 native tools would start logging `tool="{{closure}}"`.
+macro_rules! interactive {
+    ($expr:expr) => {{
+        crate::overlay::pulse();
+        native!($expr)
+    }};
+}
+
 // ─── 98 Tools ─────────────────────────────────────────────────────────────────
 // Buckle up. This is 98 MCP tool definitions in one impl block.
 // The #[tool_router] macro scans this entire block and generates a
@@ -1503,7 +1525,20 @@ impl MasterControlProgram {
     ) -> Result<CallToolResult, McpError> {
         let start = std::time::Instant::now();
         tracing::info!(tool = "screen_capture", "▶ native");
-        match crate::win32::screen::capture(input.x, input.y, input.width, input.height) {
+
+        // Capture first, glow second, deliberately. A red border baked into the
+        // JPEG is a hallucination we manufactured, in the one tool whose whole
+        // job is to be believed. The overlay sets WDA_EXCLUDEFROMCAPTURE and
+        // refuses to run if Windows will not grant it, so this should be belt
+        // and braces, but the ordering is free and does not depend on being
+        // right about that. It is not sufficient on its own either: the loop
+        // this tool lives in is click, screenshot, click, so the glow is
+        // usually already lit from the previous call by the time we get here.
+        // Both halves are load-bearing.
+        let captured = crate::win32::screen::capture(input.x, input.y, input.width, input.height);
+        crate::overlay::pulse();
+
+        match captured {
             Ok((b64, w, h)) => {
                 let ms = start.elapsed().as_millis();
                 tracing::info!(tool = "screen_capture", ms = ms as u64, "✓ native done");
@@ -1530,7 +1565,7 @@ impl MasterControlProgram {
         &self,
         Parameters(input): Parameters<MouseMoveInput>,
     ) -> Result<CallToolResult, McpError> {
-        native!(crate::win32::input::mouse_move(input.x, input.y))
+        interactive!(crate::win32::input::mouse_move(input.x, input.y))
     }
 
     #[tool(description = "Click a mouse button at the current or specified position. Supports left/right/middle click, single/double/triple click.")]
@@ -1540,7 +1575,7 @@ impl MasterControlProgram {
     ) -> Result<CallToolResult, McpError> {
         let button = input.button.as_deref().unwrap_or("left");
         let count = input.count.unwrap_or(1);
-        native!(crate::win32::input::mouse_click(input.x, input.y, button, count))
+        interactive!(crate::win32::input::mouse_click(input.x, input.y, button, count))
     }
 
     #[tool(description = "Scroll the mouse wheel at the current or specified position. Positive clicks = scroll up, negative = scroll down.")]
@@ -1548,7 +1583,7 @@ impl MasterControlProgram {
         &self,
         Parameters(input): Parameters<MouseScrollInput>,
     ) -> Result<CallToolResult, McpError> {
-        native!(crate::win32::input::mouse_scroll(input.x, input.y, input.clicks))
+        interactive!(crate::win32::input::mouse_scroll(input.x, input.y, input.clicks))
     }
 
     #[tool(description = "Click and drag from one screen position to another. Useful for moving windows, selecting text, drawing, etc.")]
@@ -1557,7 +1592,7 @@ impl MasterControlProgram {
         Parameters(input): Parameters<MouseDragInput>,
     ) -> Result<CallToolResult, McpError> {
         let button = input.button.as_deref().unwrap_or("left");
-        native!(crate::win32::input::mouse_drag(input.start_x, input.start_y, input.end_x, input.end_y, button))
+        interactive!(crate::win32::input::mouse_drag(input.start_x, input.start_y, input.end_x, input.end_y, button))
     }
 
     #[tool(description = "Type literal text strings by injecting Unicode character events. Use this ONLY for typing visible text into fields, editors, or documents. NOT for keyboard shortcuts, hotkeys, or special keys. For Ctrl+C, Enter, Escape, Tab, arrow keys, F-keys, or any modifier combo, use keyboard_key instead.")]
@@ -1565,7 +1600,7 @@ impl MasterControlProgram {
         &self,
         Parameters(input): Parameters<KeyboardTypeInput>,
     ) -> Result<CallToolResult, McpError> {
-        native!(crate::win32::input::keyboard_type(&input.text))
+        interactive!(crate::win32::input::keyboard_type(&input.text))
     }
 
     #[tool(description = "Press a keyboard shortcut, hotkey, or special key. Use this for ALL non-text key actions: Ctrl+C, Ctrl+V, Ctrl+Z, Ctrl+N, Ctrl+S, Alt+Tab, Alt+F4, Win+D, Enter, Escape, Tab, Backspace, Delete, Space, arrow keys (up/down/left/right), F1-F24, Home, End, PageUp, PageDown, Insert, PrintScreen, or any modifier combo like Ctrl+Shift+S. Format: keys joined with '+' (e.g. 'ctrl+c', 'alt+tab', 'shift+f5'). Single keys work too: 'enter', 'escape', 'b', 'x'. For typing visible text into fields or editors, use keyboard_type instead.")]
@@ -1573,7 +1608,7 @@ impl MasterControlProgram {
         &self,
         Parameters(input): Parameters<KeyboardKeyInput>,
     ) -> Result<CallToolResult, McpError> {
-        native!(crate::win32::input::keyboard_key(&input.keys))
+        interactive!(crate::win32::input::keyboard_key(&input.keys))
     }
 
     // ── Windows Update (2) ───────────────────────────────────────────────
@@ -1608,5 +1643,34 @@ impl ServerHandler for MasterControlProgram {
                  mouse control, keyboard input for full autonomous desktop interaction)."
                     .to_string(),
             )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// The tool #99 problem. Every one of these injects input at the seat, so
+    /// reaching one through plain `native!` means the machine gets driven with
+    /// no glow and nobody watching the desktop is told. Nothing else in the
+    /// type system catches that, so catch it here.
+    #[test]
+    fn every_input_tool_pulses_the_overlay() {
+        let src = include_str!("server.rs");
+        for tool in [
+            "mouse_move",
+            "mouse_click",
+            "mouse_scroll",
+            "mouse_drag",
+            "keyboard_type",
+            "keyboard_key",
+        ] {
+            assert!(
+                !src.contains(&format!("native!(crate::win32::input::{tool}")),
+                "{tool} is wired through native! instead of interactive!,                  so it will drive the machine without lighting the glow"
+            );
+            assert!(
+                src.contains(&format!("interactive!(crate::win32::input::{tool}")),
+                "{tool} no longer goes through interactive!, so the activity                  glow has silently stopped covering it"
+            );
+        }
     }
 }

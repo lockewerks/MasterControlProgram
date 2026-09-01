@@ -64,6 +64,11 @@ The Windows 11 system MCP server that every other MCP server wishes it was.
 | `keyboard_type` / `mouse_click` | Types and clicks in whatever window is focused, including the one with your bank in it. |
 | `screen_capture` | Ships a picture of your screen to a cloud model. Password manager open? That went too. |
 
+The screen edges glow red while it is driving the mouse, the keyboard or the
+camera. That is a notification, not a permission prompt: by the time you see it,
+it already happened. It tells you nothing about *what* it did, only that it is
+doing it right now. For what, read the log.
+
 None of these prompt you. That is the entire design goal. Read
 [Elevation](#elevation-or-how-we-stopped-asking-nicely) if you want to know how
 hard we worked to remove the one place Windows would have stopped it.
@@ -392,6 +397,8 @@ Sample output:
 | `MCP_POOL_SIZE` | `3` | Number of persistent PowerShell workers |
 | `RUST_LOG` | `info` | Log level (`debug`, `info`, `warn`, `error`) |
 | `MCP_ALLOW_UNELEVATED` | unset | Set to `1` to limp along without admin instead of refusing to start when sudo is unavailable. Admin-only tools will fail. Debugging aid, not a way of life. |
+| `MCP_OVERLAY` | on | Red glow around the screen edges while it is driving the mouse, the keyboard, or the camera. Set to `0` to disable. |
+| `MCP_OVERLAY_INTENSITY` | `115` | Peak alpha of that glow, 0-255. Turn it down if it is distracting, rather than off. |
 
 ## Performance
 

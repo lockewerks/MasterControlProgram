@@ -12,6 +12,7 @@
 mod clients;
 mod coerce;
 mod elevate;
+mod overlay;
 mod ps;
 mod server;
 mod win32;
@@ -120,6 +121,26 @@ async fn main() -> anyhow::Result<()> {
         Ok(()) => tracing::info!("DPI awareness: set PER_MONITOR_AWARE_V2, thread reports {awareness_label}"),
         Err(e) => tracing::warn!("DPI awareness: failed to set V2 ({e}), thread reports {awareness_label}"),
     }
+
+    // The activity glow. Spawns a thread owning one layered, click-through,
+    // capture-excluded window over the whole desktop, lit whenever a tool drives
+    // the machine, so whoever is sitting here can tell the input is not theirs.
+    //
+    // After the elevation gate, for the same reason the pwsh pool is: the
+    // unelevated wrapper sits inside gate() for the whole session, so anything
+    // above that line runs in both processes and we would draw twice.
+    //
+    // After the DPI call, and that one is not cosmetic. A window inherits DPI
+    // awareness from its thread at creation and never changes it. Created
+    // unaware, the glow gets stretched by the compositor and sized from
+    // virtualized metrics, so on a scaled display it lands in the wrong place
+    // at the wrong size. Setting the process default first means the overlay
+    // thread inherits PER_MONITOR_AWARE_V2 too.
+    //
+    // Before the pool because the pool costs the better part of a second and
+    // this is a thread spawn: overlapping them means the glow is armed before
+    // the client can land its first tool call.
+    overlay::init();
 
     // You can override pool size with MCP_POOL_SIZE env var.
     // Default is 3 because three PowerShell processes is already three too many,

@@ -6,7 +6,7 @@
 
 [product]
 name         = "MasterControlProgram"
-version      = "1.1.0"
+version      = "1.2.0"
 publisher    = "Locke Werks"
 description  = "Windows 11 system control over MCP. 98 tools, 37 direct Win32 syscalls, full computer use."
 copyright    = "Copyright (c) 2026 Locke Werks"

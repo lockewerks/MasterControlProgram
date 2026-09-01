@@ -1,6 +1,6 @@
 [package]
 name = "master-control-program"
-version = "1.1.0"
+version = "1.2.0"
 edition = "2021"
 description = "The fastest Windows 11 system control MCP server"
 
@@ -36,6 +36,7 @@ features = [
     "Win32_System_Diagnostics_ToolHelp",
     "Win32_System_ProcessStatus",
     "Win32_System_Services",
+    "Win32_System_LibraryLoader",
     "Win32_System_Registry",
     "Win32_System_SystemInformation",
     "Win32_Storage_FileSystem",
