@@ -29,6 +29,7 @@
 //! guessing and write it, installed or not, where the path is unambiguous
 //! enough to allow that.
 
+pub mod claude_code;
 pub mod claude_desktop;
 pub mod codex;
 
@@ -39,17 +40,21 @@ use std::path::Path;
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Client {
     ClaudeDesktop,
+    /// Claude Code, the CLI. Reads user-scope MCP servers from ~/.claude.json.
+    ClaudeCode,
     /// The ChatGPT desktop app, the Codex CLI and the Codex IDE extension. One
     /// config file between them, so one variant.
     Codex,
 }
 
 impl Client {
-    pub const ALL: [Client; 2] = [Client::ClaudeDesktop, Client::Codex];
+    pub const ALL: [Client; 3] =
+        [Client::ClaudeDesktop, Client::ClaudeCode, Client::Codex];
 
     pub fn label(self) -> &'static str {
         match self {
             Client::ClaudeDesktop => "Claude Desktop",
+            Client::ClaudeCode => "Claude Code",
             Client::Codex => "ChatGPT / Codex",
         }
     }
@@ -59,6 +64,7 @@ impl Client {
     pub fn flag(self) -> &'static str {
         match self {
             Client::ClaudeDesktop => "--register-claude-desktop",
+            Client::ClaudeCode => "--register-claude-code",
             Client::Codex => "--register-chatgpt",
         }
     }
@@ -69,6 +75,7 @@ impl Client {
     pub fn installed(self) -> bool {
         match self {
             Client::ClaudeDesktop => claude_desktop::installed(),
+            Client::ClaudeCode => claude_code::installed(),
             Client::Codex => codex::installed(),
         }
     }
@@ -79,6 +86,7 @@ impl Client {
     fn register(self, exe: &Path, named: bool) -> Result<()> {
         match self {
             Client::ClaudeDesktop => claude_desktop::register(exe),
+            Client::ClaudeCode => claude_code::register(exe),
             Client::Codex => codex::register(exe, named),
         }
     }
@@ -86,6 +94,7 @@ impl Client {
     fn unregister(self) -> Result<()> {
         match self {
             Client::ClaudeDesktop => claude_desktop::unregister(),
+            Client::ClaudeCode => claude_code::unregister(),
             Client::Codex => codex::unregister(),
         }
     }
@@ -122,11 +131,13 @@ impl Action {
                 "--register-claude-desktop" | "--register-claude" => {
                     (true, Some(Client::ClaudeDesktop))
                 }
+                "--register-claude-code" => (true, Some(Client::ClaudeCode)),
                 "--register-chatgpt" | "--register-codex" => (true, Some(Client::Codex)),
                 "--unregister" => (false, None),
                 "--unregister-claude-desktop" | "--unregister-claude" => {
                     (false, Some(Client::ClaudeDesktop))
                 }
+                "--unregister-claude-code" => (false, Some(Client::ClaudeCode)),
                 "--unregister-chatgpt" | "--unregister-codex" => (false, Some(Client::Codex)),
                 _ => continue,
             };
@@ -176,7 +187,7 @@ impl Action {
 
         if self.register && targets.is_empty() {
             println!("No supported MCP client found.");
-            println!("Looked for: Claude Desktop, ChatGPT / Codex.");
+            println!("Looked for: Claude Desktop, Claude Code, ChatGPT / Codex.");
             println!("Install one and re-run: \"{}\" --register", exe.display());
             return Ok(());
         }

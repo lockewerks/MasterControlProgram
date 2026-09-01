@@ -30,3 +30,6 @@ MasterControlProgram.log
 
 # Forge output: installers and staged payload
 /dist
+
+# Forge toolchain, downloaded per build and pinned in the release workflow
+/.forge-tools

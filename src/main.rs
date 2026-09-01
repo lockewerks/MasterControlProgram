@@ -12,6 +12,7 @@
 mod clients;
 mod coerce;
 mod elevate;
+mod installer;
 mod overlay;
 mod ps;
 mod server;
@@ -42,6 +43,13 @@ async fn main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().collect();
     if let Some(action) = clients::Action::from_args(&args) {
         return action.and_then(clients::Action::run);
+    }
+
+    // Installer hook: stop every other copy so an upgrade actually takes
+    // effect. Ahead of the gate because the hook is already running elevated,
+    // and a re-exec through sudo here would just be a second process to kill.
+    if args.iter().any(|a| a == installer::KILL_FLAG) {
+        return installer::kill_stale();
     }
 
     // Visual proof-of-life for the activity glow, ahead of the elevation gate

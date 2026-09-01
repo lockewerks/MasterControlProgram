@@ -217,7 +217,8 @@ Grab `MasterControlProgram-Setup.exe` from
 it. Installer, uninstaller, and the server binary are all Authenticode-signed.
 
 It checks the things that otherwise fail confusingly later (Windows build, sudo
-enabled, nothing holding the exe open), installs to
+enabled), stops any server still running from the previous version so the
+upgrade actually takes effect, installs to
 `%ProgramFiles%\MasterControlProgram`, and **registers itself with every
 supported MCP client it finds**, so nobody has to go find a config file and
 hand-edit it. Uninstalling removes the entries again and leaves your other MCP
@@ -226,7 +227,12 @@ servers alone.
 | Client | Config it writes |
 |---|---|
 | Claude Desktop | `claude_desktop_config.json`, wherever that actually lives |
+| Claude Code | `%USERPROFILE%\.claude.json` |
 | ChatGPT desktop, Codex CLI, Codex IDE extension | `%USERPROFILE%\.codex\config.toml` |
+
+Registration is idempotent: each entry is a value in a map under a fixed key, so
+installing over an existing install replaces it rather than adding a second
+copy, and your other MCP servers are never touched.
 
 The three OpenAI clients are one Codex host underneath and share a single MCP
 config, so one entry covers all three.

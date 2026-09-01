@@ -17,6 +17,14 @@ on:
 permissions:
   contents: write
 
+env:
+  # Pinned, not tracked. Forge before v0.3.0 does not implement `as = "user"`
+  # and does not fail the build over it: it flattens the key into the container
+  # and the stub never reads it, so the per-user registration hooks would run
+  # elevated and write into the administrator's profile. That is the exact
+  # outcome the key exists to prevent, arriving via the version pin.
+  FORGE_VERSION: v0.3.0
+
 jobs:
   release:
     runs-on: windows-latest
@@ -77,11 +85,77 @@ jobs:
           Write-Host "signer: $($sig.SignerCertificate.Subject)"
           if ($sig.Status -ne 'Valid') { throw "signature is $($sig.Status), refusing to publish" }
 
-      - name: Upload artifact
+      # Stage the already-signed exe. Payload members are hashed into the
+      # container and extracted verbatim, so whatever goes in here is exactly
+      # what lands on disk. Signing the finished installer does nothing for
+      # them, which is why the signing pass above comes first.
+      - name: Stage the payload
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist/payload | Out-Null
+          Copy-Item target/release/MasterControlProgram.exe dist/payload/ -Force
+
+      - name: Fetch Forge
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download $env:FORGE_VERSION --repo Locke-Werks/Forge `
+            --pattern '*.exe' --dir tools
+          if ($LASTEXITCODE -ne 0) { throw "could not download Forge $env:FORGE_VERSION" }
+          # lwstub is what the customer actually runs, and it ships signed so
+          # this repo never has to sign it. Verify rather than assume.
+          foreach ($name in 'lwforge.exe', 'lwstub.exe') {
+            $sig = Get-AuthenticodeSignature "tools/$name"
+            Write-Host "$name : $($sig.Status)"
+            if ($sig.Status -ne 'Valid') { throw "tools/$name is $($sig.Status)" }
+          }
+
+      - name: Forge the installer
+        shell: pwsh
+        run: |
+          ./tools/lwforge.exe build `
+            --config installer.toml `
+            --payload dist/payload `
+            --stub tools/lwstub.exe `
+            --out dist/MasterControlProgram-Setup.exe
+          if ($LASTEXITCODE -ne 0) { throw "forge failed" }
+
+      # Last, because stamping the version resource and appending the container
+      # both rewrite the image, and the signature is what freezes the bytes.
+      - name: Sign the installer
+        shell: pwsh
+        run: ./scripts/sign.ps1 dist/MasterControlProgram-Setup.exe
+
+      - name: Confirm the installer
+        shell: pwsh
+        run: |
+          $sig = Get-AuthenticodeSignature dist/MasterControlProgram-Setup.exe
+          Write-Host "installer: $($sig.Status)  $($sig.SignerCertificate.Subject)"
+          if ($sig.Status -ne 'Valid') { throw "installer is $($sig.Status)" }
+
+          # Signing appended a certificate table after the container. This
+          # proves that did not orphan the payload, and it is the check people
+          # leave out.
+          ./tools/lwforge.exe inspect dist/MasterControlProgram-Setup.exe
+          if ($LASTEXITCODE -ne 0) { throw "the signed installer cannot read its own container" }
+
+          # The per-user hooks are the whole reason for the version pin, so
+          # assert the container really carries them rather than trusting it.
+          $manifest = ./tools/lwforge.exe inspect dist/MasterControlProgram-Setup.exe | Out-String
+          foreach ($want in 'hooks.post_install.1.as *user', 'hooks.pre_uninstall.0.as *user') {
+            if ($manifest -notmatch $want) {
+              throw "installer is missing '$want': Forge $env:FORGE_VERSION dropped the per-user hook flag"
+            }
+          }
+
+      - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
           name: MasterControlProgram
-          path: target/release/MasterControlProgram.exe
+          path: |
+            target/release/MasterControlProgram.exe
+            dist/MasterControlProgram-Setup.exe
           if-no-files-found: error
 
       - name: Publish release
@@ -91,6 +165,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh release create $env:GITHUB_REF_NAME `
+            dist/MasterControlProgram-Setup.exe `
             target/release/MasterControlProgram.exe `
             --title $env:GITHUB_REF_NAME `
             --generate-notes
