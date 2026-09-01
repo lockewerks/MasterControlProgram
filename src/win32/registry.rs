@@ -369,7 +369,7 @@ fn search_recursive(hive: HKEY, subpath: &str, pattern: &str, limit: u32, result
         if res != ERROR_SUCCESS { break; }
         let name = String::from_utf16_lossy(&name_buf[..name_len as usize]);
         if name.to_lowercase().contains(pattern) {
-            results.push(json!({ "Path": format!("{subpath}"), "ValueName": name }));
+            results.push(json!({ "Path": subpath.to_string(), "ValueName": name }));
         }
         idx += 1;
     }
