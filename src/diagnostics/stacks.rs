@@ -127,6 +127,51 @@ pub(super) enum ThreadContext {
 }
 
 impl ThreadContext {
+    pub(super) fn set_execution(
+        &mut self,
+        thread: HANDLE,
+        address: Option<u64>,
+        trap: Option<bool>,
+    ) -> Result<()> {
+        match self {
+            Self::Native(context) => {
+                #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
+                {
+                    if let Some(address) = address {
+                        #[cfg(target_arch = "x86_64")]
+                        {
+                            context.0.Rip = address;
+                        }
+                        #[cfg(target_arch = "x86")]
+                        {
+                            context.0.Eip = u32::try_from(address)?;
+                        }
+                    }
+                    if let Some(trap) = trap {
+                        context.0.EFlags =
+                            (context.0.EFlags & !0x100) | if trap { 0x100 } else { 0 };
+                    }
+                    unsafe { SetThreadContext(thread, &context.0) }
+                        .map_err(|error| native_error("SetThreadContext", error))?;
+                }
+                #[cfg(not(any(target_arch = "x86_64", target_arch = "x86")))]
+                bail!("software breakpoint context editing requires x86 or x64");
+            }
+            #[cfg(target_arch = "x86_64")]
+            Self::Wow64(context) => {
+                if let Some(address) = address {
+                    context.Eip = u32::try_from(address)?;
+                }
+                if let Some(trap) = trap {
+                    context.EFlags = (context.EFlags & !0x100) | if trap { 0x100 } else { 0 };
+                }
+                unsafe { Wow64SetThreadContext(thread, context.as_ref()) }
+                    .map_err(|error| native_error("Wow64SetThreadContext", error))?;
+            }
+        }
+        Ok(())
+    }
+
     pub fn read(process: &Process, thread: HANDLE) -> Result<Self> {
         process.ensure_context_supported()?;
         #[cfg(target_arch = "x86_64")]

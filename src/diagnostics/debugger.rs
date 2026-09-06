@@ -18,6 +18,7 @@ use windows::core::{w, HRESULT, PCWSTR, PWSTR};
 use windows::Win32::Foundation::*;
 use windows::Win32::Storage::FileSystem::*;
 use windows::Win32::System::Diagnostics::Debug::*;
+use windows::Win32::System::Memory::*;
 use windows::Win32::System::Threading::*;
 
 use super::native::{
@@ -25,8 +26,8 @@ use super::native::{
 };
 use super::stacks::ThreadContext;
 use super::{
-    ContinueDisposition, DebugAttachInput, DebugEventsInput, DebugLaunchInput, InspectionCommand,
-    Lifetime,
+    BreakpointAction, ContinueDisposition, DebugAttachInput, DebugEventsInput, DebugLaunchInput,
+    InspectionCommand, Lifetime,
 };
 
 const MAX_ACTIVE: usize = 8;
@@ -37,6 +38,7 @@ const MAX_EVENT_BYTES: usize = 2 * 1024 * 1024;
 const MAX_ONE_EVENT: usize = 64 * 1024;
 const MAX_TRACKED_THREADS: usize = 1024;
 const MAX_TRACKED_MODULES: usize = 1024;
+const MAX_BREAKPOINTS: usize = 128;
 
 #[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -79,6 +81,8 @@ pub struct StopInfo {
     pub exception_address: String,
     pub first_chance: bool,
     pub default_disposition: &'static str,
+    pub reason: &'static str,
+    pub breakpoint_address: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -238,6 +242,19 @@ impl Shared {
 }
 
 pub(super) enum Command {
+    WriteMemory {
+        stop_id: u64,
+        address: u64,
+        bytes_base64: String,
+        expected_base64: String,
+    },
+    Breakpoint {
+        stop_id: u64,
+        action: BreakpointAction,
+    },
+    Step {
+        stop_id: u64,
+    },
     Continue {
         stop_id: u64,
         disposition: ContinueDisposition,
@@ -259,6 +276,9 @@ pub(super) enum Command {
 impl Command {
     fn name(&self) -> &'static str {
         match self {
+            Self::WriteMemory { .. } => "memory_write",
+            Self::Breakpoint { .. } => "breakpoint",
+            Self::Step { .. } => "step",
             Self::Continue { .. } => "continue",
             Self::Break => "break",
             Self::Detach => "detach",
@@ -503,6 +523,9 @@ impl DiagnosticsManager {
                     "debug_launch directs stdin/stdout/stderr to NUL. Debug events capture OutputDebugString, not console I/O; attaching to an existing terminal leaves its I/O unchanged.".into(),
                     "Windows synthesizes initial thread/module notifications when attaching. Event timestamps are observation times, not a reconstruction of earlier process history.".into(),
                     "Evaluation supports unsigned literals and native registers with checked constant offsets, not arbitrary debugger scripts or function calls.".into(),
+                    "Memory writes require exact expected bytes and fit one committed region with uniform protection. External mapping changes with identical allocation metadata and bytes cannot be distinguished.".into(),
+                    "Software breakpoints use at most 128 distinct addresses per session. Removed addresses remain reserved against memory writes until detach to recognize queued multi-thread traps.".into(),
+                    "Single-step supports x86/x64 instruction stops, not WOW64's native 64-bit loader stops. A step blocked for five seconds triggers detach and edit cleanup; no hardware breakpoints or instruction emulation.".into(),
                 ],
             },
             events: EventBuffer::new(capacity),
@@ -723,9 +746,377 @@ struct Target {
     modules: BTreeMap<u64, Value>,
     omitted_threads: u64,
     omitted_modules: u64,
+    breakpoints: BTreeMap<u64, Breakpoint>,
+    hit: Option<(u64, u32)>,
+    step: Option<Step>,
+    initial_break_seen: bool,
+    wow64_break_seen: bool,
+}
+
+struct Breakpoint {
+    original: u8,
+    enabled: bool,
+    patched: bool,
+    allocation: u64,
+    memory_type: PAGE_TYPE,
+    region_base: u64,
+    region_size: usize,
+    allocation_protection: PAGE_PROTECTION_FLAGS,
+    removed: bool,
+}
+
+impl Breakpoint {
+    fn matches_region(&self, region: &MEMORY_BASIC_INFORMATION) -> bool {
+        region.AllocationBase as u64 == self.allocation
+            && region.Type == self.memory_type
+            && region.BaseAddress as u64 == self.region_base
+            && region.RegionSize == self.region_size
+            && region.AllocationProtect == self.allocation_protection
+    }
+}
+
+struct SuspendedThread {
+    handle: Handle,
+    active: bool,
+}
+
+#[link(name = "ntdll")]
+unsafe extern "system" {
+    fn NtSuspendThread(thread: HANDLE, previous_count: *mut u32) -> NTSTATUS;
+}
+
+fn suspend_for_step(handle: Handle) -> Result<Option<SuspendedThread>> {
+    let mut prior = 0;
+    let status = unsafe { NtSuspendThread(handle.0, &mut prior) };
+    // SuspendThread maps STATUS_THREAD_IS_TERMINATING to ACCESS_DENIED. An
+    // exiting thread can still have a queued exit event and STILL_ACTIVE exit
+    // code, but cannot run target instructions. Do not suppress real denial.
+    if status.0 as u32 == 0xc000004b {
+        return Ok(None);
+    }
+    if status.0 < 0 {
+        bail!("NtSuspendThread({}) failed with NTSTATUS 0x{:08x}; access rights and protected-process restrictions apply",
+            unsafe { GetThreadId(handle.0) }, status.0 as u32);
+    }
+    Ok(Some(SuspendedThread {
+        handle,
+        active: true,
+    }))
+}
+
+impl SuspendedThread {
+    fn resume(mut self) -> Result<()> {
+        if !self.active {
+            return Ok(());
+        }
+        let result = unsafe { ResumeThread(self.handle.0) };
+        // Drop must not perform a second resume even when the API fails.
+        self.active = false;
+        if result == u32::MAX {
+            return Err(native_error(
+                "ResumeThread",
+                windows::core::Error::from_thread(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl Drop for SuspendedThread {
+    fn drop(&mut self) {
+        if self.active && unsafe { ResumeThread(self.handle.0) } == u32::MAX {
+            tracing::error!(
+                "debugger could not balance its thread suspension: {}",
+                windows::core::Error::from_thread()
+            );
+        }
+    }
+}
+
+struct Step {
+    thread: Handle,
+    tid: u32,
+    address: Option<u64>,
+    others: Vec<SuspendedThread>,
+    stop_after: bool,
+    started: std::time::Instant,
 }
 
 impl Target {
+    fn system_break(&self, address: u64, tid: u32) -> Result<bool> {
+        let region = query_region(&self.process, address)?;
+        let base = region.AllocationBase as u64;
+        let ntdll = self
+            .modules
+            .get(&base)
+            .and_then(|module| module["path"].as_str())
+            .is_some_and(|path| path.to_ascii_lowercase().ends_with("\\ntdll.dll"));
+        if !ntdll {
+            return Ok(false);
+        }
+        // Loader startup breaks are not exported on every Windows build.
+        if !self.initial_break_seen
+            || (self.process.identity.architecture == "x86"
+                && !self.wow64_break_seen
+                && base <= u64::from(u32::MAX))
+        {
+            return Ok(true);
+        }
+        let entry = remote_export(&self.process, base, b"DbgUiRemoteBreakin")?;
+        let breakpoint = remote_export(&self.process, base, b"DbgBreakPoint")?;
+        Ok(breakpoint == Some(address)
+            && entry.is_some_and(|entry| {
+                self.threads.get(&tid).and_then(Option::as_ref) == Some(&format!("0x{entry:x}"))
+            }))
+    }
+
+    fn require_x86(&self) -> Result<()> {
+        if !matches!(self.process.identity.architecture.as_str(), "x86" | "x64") {
+            bail!("software breakpoints and stepping require x86/x64/WOW64");
+        }
+        Ok(())
+    }
+
+    fn patch(&mut self, address: u64, install: bool) -> Result<()> {
+        let bp = self
+            .breakpoints
+            .get_mut(&address)
+            .context("unknown breakpoint address")?;
+        let region = memory_region(&self.process, address, 1)?;
+        if !bp.matches_region(&region) {
+            bail!(
+                "breakpoint ownership lost at 0x{address:x}: allocation changed; no bytes written"
+            );
+        }
+        let expected = if install { bp.original } else { 0xcc };
+        let replacement = if install { 0xcc } else { bp.original };
+        let observed = read_memory(&self.process, address, 1)?;
+        // An uncertain earlier write may have left the original byte intact.
+        if !install && observed.bytes == [bp.original] && observed.error.is_none() {
+            bp.patched = false;
+            return Ok(());
+        }
+        if observed.bytes != [expected] || observed.error.is_some() {
+            bail!("breakpoint ownership lost at 0x{address:x}: expected {expected:02x}, observed {:?}; no bytes written", observed.bytes);
+        }
+        if install {
+            bp.patched = true;
+        }
+        let report = guarded_write(&self.process, address, &[replacement], &[expected])?;
+        if !report.complete {
+            bail!(
+                "breakpoint patch failed or partial: {}",
+                serde_json::to_string(&report)?
+            );
+        }
+        bp.patched = install;
+        Ok(())
+    }
+
+    fn own_hit(&mut self, address: u64, tid: u32) -> Result<bool> {
+        let Some(bp) = self.breakpoints.get(&address) else {
+            return Ok(false);
+        };
+        let region = memory_region(&self.process, address, 1)?;
+        let observed = read_memory(&self.process, address, 1)?;
+        let expected = if bp.patched { 0xcc } else { bp.original };
+        if !bp.matches_region(&region) || observed.bytes != [expected] || observed.error.is_some() {
+            bail!("breakpoint ownership lost at 0x{address:x}; no context or bytes changed");
+        }
+        let (thread, _) = open_thread(&self.process, tid, THREAD_GET_CONTEXT | THREAD_SET_CONTEXT)?;
+        let mut context = ThreadContext::read(&self.process, thread.0)?;
+        let registers = context.registers();
+        let ip = registers
+            .get("rip")
+            .or_else(|| registers.get("eip"))
+            .copied();
+        if ip != address.checked_add(1) {
+            bail!("owned breakpoint has unexpected instruction pointer at 0x{address:x}");
+        }
+        // Rewind before restoring so cleanup never skips the original instruction.
+        context.set_execution(thread.0, Some(address), None)?;
+        if self.step.is_none() {
+            self.hit = Some((address, tid));
+            self.patch(address, false)?;
+        }
+        Ok(true)
+    }
+
+    fn start_step(&mut self, tid: u32, stop_after: bool) -> Result<()> {
+        self.require_x86()?;
+        if self.step.is_some() {
+            bail!("single-step is already pending");
+        }
+        if self.omitted_threads != 0 {
+            bail!("cannot step safely with untracked target threads");
+        }
+        let (thread, _) = open_thread(&self.process, tid, THREAD_GET_CONTEXT | THREAD_SET_CONTEXT)?;
+        let mut context = ThreadContext::read(&self.process, thread.0)?;
+        if context
+            .registers()
+            .get("eflags")
+            .is_some_and(|flags| flags & 0x100 != 0)
+        {
+            bail!("target already has its trap flag set; step ownership is ambiguous");
+        }
+        let mut others = Vec::new();
+        for other in self.threads.keys().copied().filter(|other| *other != tid) {
+            let (handle, _) = open_thread(&self.process, other, THREAD_SUSPEND_RESUME)?;
+            let mut exit = 0;
+            unsafe { GetExitCodeThread(handle.0, &mut exit) }
+                .map_err(|error| native_error("GetExitCodeThread before single-step", error))?;
+            if exit != STILL_ACTIVE.0 as u32 {
+                continue;
+            }
+            if let Some(thread) = suspend_for_step(handle)? {
+                others.push(thread);
+            }
+        }
+        context.set_execution(thread.0, None, Some(true))?;
+        self.step = Some(Step {
+            thread,
+            tid,
+            address: self.hit.map(|hit| hit.0),
+            others,
+            stop_after,
+            started: std::time::Instant::now(),
+        });
+        // Keep the step record until continuation succeeds so detach can clear TF.
+        self.continue_event(Some(DBG_CONTINUE))?;
+        self.hit = None;
+        Ok(())
+    }
+
+    fn finish_step(&mut self, thread_exited: bool, reinsert: bool) -> Result<bool> {
+        let Some(step) = self.step.take() else {
+            return Ok(false);
+        };
+        let mut failures = Vec::new();
+        if !thread_exited {
+            if let Err(error) = ThreadContext::read(&self.process, step.thread.0)
+                .and_then(|mut context| context.set_execution(step.thread.0, None, Some(false)))
+            {
+                self.step = Some(step);
+                bail!("clear single-step flag: {error:#}");
+            }
+        }
+        if reinsert {
+            if let Some(address) = step.address {
+                if self.breakpoints.get(&address).is_some_and(|bp| bp.enabled) {
+                    if let Err(error) = self.patch(address, true) {
+                        failures.push(format!("reinsert breakpoint: {error:#}"));
+                    }
+                }
+            }
+        }
+        for thread in step.others {
+            if let Err(error) = thread.resume() {
+                failures.push(format!("{error:#}"));
+            }
+        }
+        if !failures.is_empty() {
+            bail!("{}", failures.join("; "));
+        }
+        Ok(step.stop_after)
+    }
+
+    fn cleanup_edits(&mut self) -> Result<()> {
+        if self.breakpoints.is_empty() && self.step.is_none() {
+            return Ok(());
+        }
+        if unsafe { WaitForSingleObject(self.process.handle.0, 0) } == WAIT_OBJECT_0 {
+            self.breakpoints.clear();
+            if let Some(step) = self.step.as_mut() {
+                for thread in &mut step.others {
+                    thread.active = false;
+                }
+            }
+            self.finish_step(true, false)?;
+            return Ok(());
+        }
+        let mut step_thread_exited = false;
+        if self.pending.is_none() {
+            // A debug event freezes every target thread, including threads whose
+            // creation event has not yet been consumed by this actor.
+            unsafe { DebugBreakProcess(self.process.handle.0) }
+                .map_err(|error| native_error("DebugBreakProcess for edit cleanup", error))?;
+            let mut event = DEBUG_EVENT::default();
+            unsafe { WaitForDebugEventEx(&mut event, 10_000) }
+                .map_err(|error| native_error("WaitForDebugEventEx for edit cleanup", error))?;
+            let mut disposition = DBG_CONTINUE;
+            if event.dwDebugEventCode == EXCEPTION_DEBUG_EVENT {
+                let info = unsafe { event.u.Exception };
+                let code = info.ExceptionRecord.ExceptionCode.0 as u32;
+                let address = info.ExceptionRecord.ExceptionAddress as u64;
+                disposition = default_exception_status(code);
+                self.pending = Some(Pending {
+                    process_id: event.dwProcessId,
+                    thread_id: event.dwThreadId,
+                    default_disposition: disposition,
+                });
+                if (is_breakpoint(code)
+                    && (self.own_hit(address, event.dwThreadId)?
+                        || self.system_break(address, event.dwThreadId)?))
+                    || (self
+                        .step
+                        .as_ref()
+                        .is_some_and(|step| step.tid == event.dwThreadId)
+                        && is_single_step(code))
+                {
+                    disposition = DBG_CONTINUE;
+                }
+            } else if event.dwDebugEventCode == CREATE_PROCESS_DEBUG_EVENT {
+                let _file = Handle(unsafe { event.u.CreateProcessInfo.hFile });
+            } else if event.dwDebugEventCode == LOAD_DLL_DEBUG_EVENT {
+                let _file = Handle(unsafe { event.u.LoadDll.hFile });
+            } else if event.dwDebugEventCode == EXIT_THREAD_DEBUG_EVENT {
+                step_thread_exited = self
+                    .step
+                    .as_ref()
+                    .is_some_and(|step| step.tid == event.dwThreadId);
+                if let Some(step) = self.step.as_mut() {
+                    for thread in &mut step.others {
+                        if unsafe { GetThreadId(thread.handle.0) } == event.dwThreadId {
+                            thread.active = false;
+                        }
+                    }
+                }
+            } else if event.dwDebugEventCode == EXIT_PROCESS_DEBUG_EVENT {
+                step_thread_exited = true;
+                self.breakpoints.clear();
+                if let Some(step) = self.step.as_mut() {
+                    for thread in &mut step.others {
+                        thread.active = false;
+                    }
+                }
+            }
+            self.pending = Some(Pending {
+                process_id: event.dwProcessId,
+                thread_id: event.dwThreadId,
+                default_disposition: disposition,
+            });
+        }
+        let mut failures = Vec::new();
+        if let Err(error) = self.finish_step(step_thread_exited, false) {
+            failures.push(format!("{error:#}"));
+        }
+        let addresses: Vec<_> = self
+            .breakpoints
+            .iter()
+            .filter(|(_, bp)| bp.patched)
+            .map(|(address, _)| *address)
+            .collect();
+        for address in addresses {
+            if let Err(error) = self.patch(address, false) {
+                failures.push(format!("{error:#}"));
+            }
+        }
+        if !failures.is_empty() {
+            bail!("debugger edit cleanup incomplete: {}", failures.join("; "));
+        }
+        Ok(())
+    }
+
     fn remember_thread(&mut self, tid: u32, address: Option<String>) {
         if self.threads.len() < MAX_TRACKED_THREADS || self.threads.contains_key(&tid) {
             self.threads.insert(tid, address);
@@ -762,13 +1153,20 @@ impl Target {
             return Ok(());
         }
         self.detach_attempted = true;
+        let cleanup = self.cleanup_edits();
+        // Even failed cleanup must release owned suspension counts and detach.
+        if self.step.is_some() {
+            let step = self.step.take();
+            drop(step);
+        }
         let continued = self.continue_event(None);
         let stopped = unsafe { DebugActiveProcessStop(self.process.identity.pid) };
         match stopped {
             Ok(()) => {
                 self.attached = false;
                 self.pending = None;
-                continued
+                cleanup
+                    .and(continued)
                     .context("target detached, but continuing the outstanding debug event failed")
             }
             Err(_) if unsafe { WaitForSingleObject(self.process.handle.0, 0) } == WAIT_OBJECT_0 => {
@@ -1054,6 +1452,11 @@ fn start_target(start: Start, deadline: &Deadline, shutdown: &AtomicBool) -> Res
         modules: BTreeMap::new(),
         omitted_threads: 0,
         omitted_modules: 0,
+        breakpoints: BTreeMap::new(),
+        hit: None,
+        step: None,
+        initial_break_seen: false,
+        wow64_break_seen: false,
     };
     if let Err(error) = unsafe { DebugSetProcessKillOnExit(false) } {
         let detached = target.detach();
@@ -1139,7 +1542,7 @@ fn actor(
             Err(cleanup) => format!("{error:#}; detach also failed: {cleanup:#}"),
         };
         fail_record(&shared, &message);
-        return cleanup.map_err(|error| format!("{error:#}"));
+        return Err(message);
     }
     Ok(())
 }
@@ -1166,6 +1569,13 @@ fn debug_loop(
     shutdown: &AtomicBool,
 ) -> Result<()> {
     while target.attached {
+        if target
+            .step
+            .as_ref()
+            .is_some_and(|step| step.started.elapsed() > Duration::from_secs(5))
+        {
+            bail!("single-step exceeded five seconds; detaching with edit cleanup rather than leaving threads suspended");
+        }
         if shutdown.load(Ordering::Acquire) {
             target.detach()?;
             let mut record = shared.lock()?;
@@ -1214,14 +1624,16 @@ fn debug_loop(
     Ok(())
 }
 
-fn default_exception_status(code: u32) -> NTSTATUS {
-    // Breakpoint exceptions are debugger stops. Other first- and second-chance
-    // exceptions are passed to the target unless the caller explicitly handles them.
-    if code == 0x80000003 || code == 0x4000001f {
-        DBG_CONTINUE
-    } else {
-        DBG_EXCEPTION_NOT_HANDLED
-    }
+fn default_exception_status(_code: u32) -> NTSTATUS {
+    DBG_EXCEPTION_NOT_HANDLED
+}
+
+fn is_breakpoint(code: u32) -> bool {
+    matches!(code, 0x80000003 | 0x4000001f)
+}
+
+fn is_single_step(code: u32) -> bool {
+    matches!(code, 0x80000004 | 0x4000001e)
 }
 
 fn module_info(file: HANDLE, base: u64) -> Value {
@@ -1244,7 +1656,7 @@ fn module_info(file: HANDLE, base: u64) -> Value {
 
 fn handle_event(target: &mut Target, shared: &Shared, event: DEBUG_EVENT) -> Result<()> {
     let exception = event.dwDebugEventCode == EXCEPTION_DEBUG_EVENT;
-    let disposition = if exception {
+    let mut disposition = if exception {
         default_exception_status(
             unsafe { event.u.Exception.ExceptionRecord.ExceptionCode }.0 as u32,
         )
@@ -1259,6 +1671,94 @@ fn handle_event(target: &mut Target, shared: &Shared, event: DEBUG_EVENT) -> Res
         default_disposition: disposition,
     });
     let tid = event.dwThreadId;
+    let mut reason = "exception";
+    let mut breakpoint_address = None;
+    if exception {
+        let info = unsafe { event.u.Exception };
+        let code = info.ExceptionRecord.ExceptionCode.0 as u32;
+        let address = info.ExceptionRecord.ExceptionAddress as u64;
+        if target.step.as_ref().is_some_and(|step| step.tid == tid) {
+            let reinserted = target
+                .step
+                .as_ref()
+                .and_then(|step| step.address)
+                .filter(|address| target.breakpoints.get(address).is_some_and(|bp| bp.enabled));
+            let stop_after = target.finish_step(false, true)?;
+            if is_single_step(code) {
+                disposition = DBG_CONTINUE;
+                target
+                    .pending
+                    .as_mut()
+                    .context("missing step event")?
+                    .default_disposition = disposition;
+                shared.lock()?.event("step_completed", Some(tid), json!({
+                    "address": format!("0x{address:x}"), "step_observed": true,
+                    "breakpoint_reinserted": reinserted.map(|address| format!("0x{address:x}")), "stop_after": stop_after,
+                }))?;
+                if !stop_after {
+                    target.continue_event(None)?;
+                    return Ok(());
+                }
+                reason = "single_step";
+            }
+        }
+        if is_breakpoint(code) {
+            if target.own_hit(address, tid)? {
+                disposition = DBG_CONTINUE;
+                if target.step.is_some() {
+                    // Several threads can trap before Windows delivers the first
+                    // event. Our suspend count keeps queued threads parked at the
+                    // rewound address until reinsertion makes them trap again.
+                    target
+                        .pending
+                        .as_mut()
+                        .context("missing queued breakpoint event")?
+                        .default_disposition = disposition;
+                    shared.lock()?.event("breakpoint_queued", Some(tid), json!({
+                        "address": format!("0x{address:x}"), "instruction_pointer_rewound": true,
+                    }))?;
+                    target.continue_event(None)?;
+                    return Ok(());
+                }
+                if target
+                    .breakpoints
+                    .get(&address)
+                    .is_some_and(|bp| !bp.enabled)
+                {
+                    target.hit = None;
+                    target.continue_event(Some(DBG_CONTINUE))?;
+                    shared.lock()?.event("retired_breakpoint_drained", Some(tid), json!({
+                        "address": format!("0x{address:x}"), "instruction_pointer_rewound": true,
+                    }))?;
+                    return Ok(());
+                }
+                reason = "software_breakpoint";
+                breakpoint_address = Some(format!("0x{address:x}"));
+            } else if !target.initial_break_seen && target.system_break(address, tid)? {
+                target.initial_break_seen = true;
+                target.wow64_break_seen = code == 0x4000001f;
+                disposition = DBG_CONTINUE;
+                reason = "initial_breakpoint";
+            } else if code == 0x4000001f
+                && !target.wow64_break_seen
+                && target.system_break(address, tid)?
+            {
+                target.wow64_break_seen = true;
+                disposition = DBG_CONTINUE;
+                reason = "wow64_initial_breakpoint";
+            } else if shared.view()?.break_requested && target.system_break(address, tid)? {
+                disposition = DBG_CONTINUE;
+                reason = "requested_break";
+            } else {
+                reason = "foreign_breakpoint";
+            }
+        }
+        target
+            .pending
+            .as_mut()
+            .context("missing exception event")?
+            .default_disposition = disposition;
+    }
     let (kind, data) = unsafe {
         match event.dwDebugEventCode {
             CREATE_PROCESS_DEBUG_EVENT => {
@@ -1289,10 +1789,28 @@ fn handle_event(target: &mut Target, shared: &Shared, event: DEBUG_EVENT) -> Res
                     .lpStartAddress
                     .map(|address| format!("0x{:x}", address as usize));
                 target.remember_thread(tid, address.clone());
+                if let Some(step) = target.step.as_mut() {
+                    let (thread, _) = open_thread(&target.process, tid, THREAD_SUSPEND_RESUME)?;
+                    if let Some(thread) = suspend_for_step(thread)? {
+                        step.others.push(thread);
+                    }
+                }
                 ("thread_created", json!({ "start_address": address }))
             }
             EXIT_THREAD_DEBUG_EVENT => {
                 target.threads.remove(&tid);
+                if target.step.as_ref().is_some_and(|step| step.tid == tid) {
+                    target.finish_step(true, true)?;
+                } else if let Some(step) = target.step.as_mut() {
+                    if let Some(index) = step
+                        .others
+                        .iter()
+                        .position(|thread| GetThreadId(thread.handle.0) == tid)
+                    {
+                        let mut thread = step.others.remove(index);
+                        thread.active = false;
+                    }
+                }
                 (
                     "thread_exited",
                     json!({ "exit_code": event.u.ExitThread.dwExitCode }),
@@ -1307,6 +1825,20 @@ fn handle_event(target: &mut Target, shared: &Shared, event: DEBUG_EVENT) -> Res
             UNLOAD_DLL_DEBUG_EVENT => {
                 let base = event.u.UnloadDll.lpBaseOfDll as u64;
                 target.modules.remove(&base);
+                let removed: Vec<_> = target
+                    .breakpoints
+                    .iter()
+                    .filter(|(_, bp)| bp.allocation == base)
+                    .map(|(address, _)| *address)
+                    .collect();
+                for address in &removed {
+                    target.breakpoints.remove(address);
+                }
+                if !removed.is_empty() {
+                    shared.lock()?.event("breakpoints_invalidated", Some(tid), json!({
+                        "reason": "module_unloaded", "addresses": removed.iter().map(|address| format!("0x{address:x}")).collect::<Vec<_>>(),
+                    }))?;
+                }
                 ("module_unloaded", json!({ "base": format!("0x{base:x}") }))
             }
             OUTPUT_DEBUG_STRING_EVENT => {
@@ -1391,11 +1923,20 @@ fn handle_event(target: &mut Target, shared: &Shared, event: DEBUG_EVENT) -> Res
             } else {
                 "not_handled"
             },
+            reason,
+            breakpoint_address,
         });
     } else {
         shared.lock()?.event(kind, Some(tid), data)?;
         target.continue_event(None)?;
         if event.dwDebugEventCode == EXIT_PROCESS_DEBUG_EVENT {
+            target.breakpoints.clear();
+            if let Some(step) = target.step.as_mut() {
+                for thread in &mut step.others {
+                    thread.active = false;
+                }
+            }
+            target.finish_step(true, false)?;
             target.attached = false;
             let mut record = shared.lock()?;
             record.view.exit_code = Some(unsafe { event.u.ExitProcess.dwExitCode });
@@ -1437,7 +1978,9 @@ fn execute_envelope(target: &mut Target, shared: &Shared, envelope: Envelope) ->
             .and_then(|()| execute(target, shared, command, &deadline))
     };
     let event = match &result {
-        Ok(_) => json!({ "request_id": request_id, "command": name, "native_accepted": true }),
+        Ok(data) => {
+            json!({ "request_id": request_id, "command": name, "native_accepted": data.get("api_success").and_then(Value::as_bool).unwrap_or(true) })
+        }
         Err(error) => json!({
             "request_id": request_id, "command": name, "native_accepted": null,
             "outcome": "failed_or_partial", "automatic_retry_safe": false, "error": format!("{error:#}"),
@@ -1453,7 +1996,10 @@ fn execute_envelope(target: &mut Target, shared: &Shared, envelope: Envelope) ->
     let result = result.and_then(|data| {
         Ok(CommandReply {
             request_id,
-            native_accepted: true,
+            native_accepted: data
+                .get("api_success")
+                .and_then(Value::as_bool)
+                .unwrap_or(true),
             application_completion_observed: false,
             session: shared.view()?,
             data,
@@ -1470,11 +2016,177 @@ fn execute(
     deadline: &Deadline,
 ) -> Result<Value> {
     match command {
+        Command::WriteMemory {
+            stop_id,
+            address,
+            bytes_base64,
+            expected_base64,
+        } => {
+            require_stop(shared, stop_id)?;
+            let bytes = decode_write_bytes(&bytes_base64)?;
+            let expected = decode_write_bytes(&expected_base64)?;
+            let end = address
+                .checked_add(bytes.len() as u64)
+                .context("memory address overflow")?;
+            if target.breakpoints.range(address..end).next().is_some()
+                || target
+                    .hit
+                    .is_some_and(|(hit, _)| hit >= address && hit < end)
+                || target
+                    .step
+                    .as_ref()
+                    .and_then(|step| step.address)
+                    .is_some_and(|hit| hit >= address && hit < end)
+            {
+                bail!("memory write overlaps an owned breakpoint or its pending instruction");
+            }
+            let report = guarded_write(&target.process, address, &bytes, &expected)?;
+            let data = serde_json::to_value(report)?;
+            shared.lock()?.event("memory_written", None, data.clone())?;
+            Ok(data)
+        }
+        Command::Breakpoint { stop_id, action } => {
+            require_stop(shared, stop_id)?;
+            target.require_x86()?;
+            match action {
+                BreakpointAction::List => {}
+                BreakpointAction::Add {
+                    address,
+                    expected_byte,
+                } => {
+                    if target.hit.is_some_and(|hit| hit.0 == address)
+                        || target
+                            .step
+                            .as_ref()
+                            .is_some_and(|step| step.address == Some(address))
+                    {
+                        bail!("cannot add a breakpoint while its previous hit or step is pending");
+                    }
+                    if target
+                        .breakpoints
+                        .get(&address)
+                        .is_some_and(|bp| !bp.removed)
+                    {
+                        bail!("breakpoint address is already owned");
+                    }
+                    if target.breakpoints.len() >= MAX_BREAKPOINTS
+                        && !target.breakpoints.contains_key(&address)
+                    {
+                        bail!("at most {MAX_BREAKPOINTS} distinct breakpoint addresses per session, including removed addresses retained for queued trap cleanup");
+                    }
+                    if expected_byte == 0xcc {
+                        bail!("existing INT3 cannot be claimed as a software breakpoint");
+                    }
+                    let region = memory_region(&target.process, address, 1)?;
+                    if !executable(region.Protect) {
+                        bail!("software breakpoint requires executable memory");
+                    }
+                    let observed = read_memory(&target.process, address, 1)?;
+                    if observed.bytes != [expected_byte] || observed.error.is_some() {
+                        bail!("breakpoint expected byte mismatch; no bytes written");
+                    }
+                    target.breakpoints.insert(
+                        address,
+                        Breakpoint {
+                            original: expected_byte,
+                            enabled: true,
+                            patched: false,
+                            allocation: region.AllocationBase as u64,
+                            memory_type: region.Type,
+                            region_base: region.BaseAddress as u64,
+                            region_size: region.RegionSize,
+                            allocation_protection: region.AllocationProtect,
+                            removed: false,
+                        },
+                    );
+                    target.patch(address, true)?;
+                }
+                BreakpointAction::Enable { address } => {
+                    let bp = target
+                        .breakpoints
+                        .get(&address)
+                        .filter(|bp| !bp.removed)
+                        .context("unknown breakpoint address")?;
+                    if !bp.patched
+                        && !target.hit.is_some_and(|hit| hit.0 == address)
+                        && !target
+                            .step
+                            .as_ref()
+                            .is_some_and(|step| step.address == Some(address))
+                    {
+                        target.patch(address, true)?;
+                    }
+                    target
+                        .breakpoints
+                        .get_mut(&address)
+                        .context("unknown breakpoint address")?
+                        .enabled = true;
+                }
+                BreakpointAction::Disable { address } | BreakpointAction::Remove { address } => {
+                    let bp = target
+                        .breakpoints
+                        .get(&address)
+                        .filter(|bp| !bp.removed)
+                        .context("unknown breakpoint address")?;
+                    if bp.patched {
+                        target.patch(address, false)?;
+                    }
+                    if matches!(action, BreakpointAction::Remove { .. }) {
+                        let bp = target
+                            .breakpoints
+                            .get_mut(&address)
+                            .context("unknown breakpoint address")?;
+                        bp.enabled = false;
+                        bp.removed = true;
+                    } else {
+                        target
+                            .breakpoints
+                            .get_mut(&address)
+                            .context("unknown breakpoint address")?
+                            .enabled = false;
+                    }
+                }
+            }
+            Ok(
+                json!({ "retained_address_count": target.breakpoints.len(), "breakpoints": target.breakpoints.iter().filter(|(_, bp)| !bp.removed).map(|(address, bp)| json!({
+                "address": format!("0x{address:x}"), "original_byte": bp.original,
+                "enabled": bp.enabled, "patched": bp.patched,
+                "hit_pending": target.hit.is_some_and(|hit| hit.0 == *address),
+                "step_pending": target.step.as_ref().is_some_and(|step| step.address == Some(*address)),
+            })).collect::<Vec<_>>() }),
+            )
+        }
+        Command::Step { stop_id } => {
+            let stop = require_stop(shared, stop_id)?;
+            if target.process.identity.architecture == "x86"
+                && integer(&stop.exception_address)? > u64::from(u32::MAX)
+            {
+                bail!("WOW64 native loader stop is outside the x86 instruction context; continue to an x86 stop before stepping");
+            }
+            if stop.default_disposition != "handled" {
+                bail!("cannot single-step an unhandled application exception; explicitly continue it first");
+            }
+            target.start_step(stop.thread_id, true)?;
+            shared.lock()?.state(State::Running)?;
+            Ok(
+                json!({ "debug_event_continued": true, "step_requested": true, "step_observed": false }),
+            )
+        }
         Command::Continue {
             stop_id,
             disposition,
         } => {
-            require_stop(shared, stop_id)?;
+            let stop = require_stop(shared, stop_id)?;
+            if target.hit.is_some() {
+                if matches!(disposition, ContinueDisposition::NotHandled) {
+                    bail!("owned software breakpoint must be handled to execute its restored instruction");
+                }
+                target.start_step(stop.thread_id, false)?;
+                shared.lock()?.state(State::Running)?;
+                return Ok(
+                    json!({ "debug_event_continued": true, "step_requested": true, "step_observed": false }),
+                );
+            }
             let disposition = match disposition {
                 ContinueDisposition::Default => None,
                 ContinueDisposition::Handled => Some(DBG_CONTINUE),
@@ -1595,6 +2307,300 @@ struct Memory {
     error: Option<String>,
 }
 
+fn decode_write_bytes(encoded: &str) -> Result<Vec<u8>> {
+    if encoded.len() > 65536_usize.div_ceil(3) * 4 {
+        bail!("encoded memory write exceeds 65536-byte bound");
+    }
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .context("invalid base64 memory bytes")?;
+    if !(1..=65536).contains(&bytes.len()) {
+        bail!("memory write requires 1-65536 bytes");
+    }
+    Ok(bytes)
+}
+
+fn executable(protection: PAGE_PROTECTION_FLAGS) -> bool {
+    protection.0
+        & (PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY).0
+        != 0
+}
+
+fn remote_export(process: &Process, base: u64, name: &[u8]) -> Result<Option<u64>> {
+    let read = |offset: u64, length: usize| -> Result<Vec<u8>> {
+        let memory = read_native_memory(
+            process,
+            base.checked_add(offset).context("PE address overflow")?,
+            length,
+        )?;
+        if memory.error.is_some() || memory.bytes.len() != length {
+            bail!("incomplete ntdll export read");
+        }
+        Ok(memory.bytes)
+    };
+    let word = |bytes: &[u8], at: usize| {
+        u32::from_le_bytes(bytes[at..at + 4].try_into().expect("bounded PE field"))
+    };
+    let dos = read(0, 64)?;
+    if &dos[..2] != b"MZ" {
+        bail!("invalid ntdll DOS header");
+    }
+    let pe_offset = u64::from(word(&dos, 60));
+    if pe_offset > 1024 * 1024 {
+        bail!("ntdll PE header offset exceeds bound");
+    }
+    let pe = read(pe_offset, 144)?;
+    if &pe[..4] != b"PE\0\0" {
+        bail!("invalid ntdll PE header");
+    }
+    let directory_offset = match u16::from_le_bytes([pe[24], pe[25]]) {
+        0x10b => 120,
+        0x20b => 136,
+        _ => bail!("unsupported ntdll optional header"),
+    };
+    let export = read(u64::from(word(&pe, directory_offset)), 40)?;
+    let count = word(&export, 24) as usize;
+    if count > 8192 {
+        bail!("ntdll export count exceeds bound");
+    }
+    let names = read(u64::from(word(&export, 32)), count * 4)?;
+    let mut low = 0;
+    let mut high = count;
+    while low < high {
+        let mid = low + (high - low) / 2;
+        let bytes = read(u64::from(word(&names, mid * 4)), 64)?;
+        let end = bytes
+            .iter()
+            .position(|byte| *byte == 0)
+            .context("ntdll export name exceeds bound")?;
+        match bytes[..end].cmp(name) {
+            std::cmp::Ordering::Less => low = mid + 1,
+            std::cmp::Ordering::Greater => high = mid,
+            std::cmp::Ordering::Equal => {
+                let ordinal = read(u64::from(word(&export, 36)) + mid as u64 * 2, 2)?;
+                let ordinal = u16::from_le_bytes([ordinal[0], ordinal[1]]);
+                if u32::from(ordinal) >= word(&export, 20) {
+                    bail!("invalid ntdll export ordinal");
+                }
+                let rva = read(u64::from(word(&export, 28)) + u64::from(ordinal) * 4, 4)?;
+                return Ok(Some(
+                    base.checked_add(u64::from(word(&rva, 0)))
+                        .context("export address overflow")?,
+                ));
+            }
+        }
+    }
+    Ok(None)
+}
+
+fn memory_region(
+    process: &Process,
+    address: u64,
+    length: usize,
+) -> Result<MEMORY_BASIC_INFORMATION> {
+    let end = address
+        .checked_add(length as u64)
+        .context("memory address overflow")?;
+    if length == 0
+        || length > 65536
+        || (process.identity.architecture == "x86" && end > u64::from(u32::MAX) + 1)
+    {
+        bail!("memory write range exceeds target address space or byte bound");
+    }
+    let region = query_region(process, address)?;
+    if region.State != MEM_COMMIT || region.Protect.0 & (PAGE_GUARD | PAGE_NOACCESS).0 != 0 {
+        bail!("memory must be committed and accessible, without PAGE_GUARD");
+    }
+    if end > (region.BaseAddress as u64).saturating_add(region.RegionSize as u64) {
+        bail!("memory write must fit one committed region with uniform protection");
+    }
+    Ok(region)
+}
+
+fn query_region(process: &Process, address: u64) -> Result<MEMORY_BASIC_INFORMATION> {
+    let pointer =
+        usize::try_from(address).context("memory address exceeds debugger address space")?;
+    let mut region = MEMORY_BASIC_INFORMATION::default();
+    if unsafe {
+        VirtualQueryEx(
+            process.handle.0,
+            Some(pointer as *const _),
+            &mut region,
+            size_of::<MEMORY_BASIC_INFORMATION>(),
+        )
+    } == 0
+    {
+        return Err(native_error(
+            "VirtualQueryEx",
+            windows::core::Error::from_thread(),
+        ));
+    }
+    Ok(region)
+}
+
+struct RestoreProtection {
+    process: HANDLE,
+    address: usize,
+    length: usize,
+    original: Option<PAGE_PROTECTION_FLAGS>,
+}
+
+impl RestoreProtection {
+    fn restore(&mut self) -> Result<()> {
+        if let Some(original) = self.original {
+            let mut unused = PAGE_PROTECTION_FLAGS::default();
+            unsafe {
+                VirtualProtectEx(
+                    self.process,
+                    self.address as *const _,
+                    self.length,
+                    original,
+                    &mut unused,
+                )
+            }
+            .map_err(|error| native_error("restore memory protection", error))?;
+            self.original = None;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for RestoreProtection {
+    fn drop(&mut self) {
+        if let Err(error) = self.restore() {
+            tracing::error!(%error, "debugger memory protection cleanup failed");
+        }
+    }
+}
+
+#[derive(Serialize)]
+pub(super) struct WriteReport {
+    address: String,
+    requested_bytes: usize,
+    written_bytes: usize,
+    requested_base64: String,
+    before_base64: String,
+    readback_base64: String,
+    readback_bytes: usize,
+    api_success: bool,
+    complete: bool,
+    partial: bool,
+    protection_restored: bool,
+    instruction_cache_flushed: bool,
+    errors: Vec<String>,
+}
+
+pub(super) fn guarded_write(
+    process: &Process,
+    address: u64,
+    bytes: &[u8],
+    expected: &[u8],
+) -> Result<WriteReport> {
+    if bytes.len() != expected.len() {
+        bail!("replacement and expected bytes must have equal length");
+    }
+    let region = memory_region(process, address, bytes.len())?;
+    let before = read_memory(process, address, bytes.len())?;
+    if before.error.is_some() || before.bytes != expected {
+        bail!("memory expected bytes mismatch or incomplete read; no bytes written; observed_base64={}",
+            base64::engine::general_purpose::STANDARD.encode(&before.bytes));
+    }
+    let is_executable = executable(region.Protect);
+    let writable = region.Protect.0
+        & (PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY).0
+        != 0;
+    let mut protection = RestoreProtection {
+        process: process.handle.0,
+        address: address as usize,
+        length: bytes.len(),
+        original: None,
+    };
+    if !writable {
+        let mut original = PAGE_PROTECTION_FLAGS::default();
+        unsafe {
+            VirtualProtectEx(
+                process.handle.0,
+                address as *const _,
+                bytes.len(),
+                if is_executable {
+                    PAGE_EXECUTE_READWRITE
+                } else {
+                    PAGE_READWRITE
+                },
+                &mut original,
+            )
+        }
+        .map_err(|error| native_error("VirtualProtectEx for memory write", error))?;
+        protection.original = Some(original);
+    }
+    let mut written = 0;
+    // No retry: a failed call may still have modified some target bytes.
+    let result = unsafe {
+        WriteProcessMemory(
+            process.handle.0,
+            address as *const _,
+            bytes.as_ptr().cast(),
+            bytes.len(),
+            Some(&mut written),
+        )
+    };
+    let api_success = result.is_ok();
+    let mut errors = Vec::new();
+    if let Err(error) = result {
+        errors.push(format!("{:#}", native_error("WriteProcessMemory", error)));
+    }
+    let mut instruction_cache_flushed = false;
+    if is_executable {
+        match unsafe {
+            FlushInstructionCache(process.handle.0, Some(address as *const _), bytes.len())
+        } {
+            Ok(()) => instruction_cache_flushed = true,
+            Err(error) => errors.push(format!(
+                "{:#}",
+                native_error("FlushInstructionCache", error)
+            )),
+        }
+    }
+    let protection_restored = match protection.restore() {
+        Ok(()) => true,
+        Err(error) => {
+            errors.push(format!("{error:#}"));
+            false
+        }
+    };
+    let readback = match read_memory(process, address, bytes.len()) {
+        Ok(memory) => {
+            if let Some(error) = memory.error {
+                errors.push(error);
+            }
+            memory.bytes
+        }
+        Err(error) => {
+            errors.push(format!("{error:#}"));
+            Vec::new()
+        }
+    };
+    if written != bytes.len() || readback != bytes {
+        errors.push("written byte count or readback does not match the requested bytes".into());
+    }
+    let complete = api_success && errors.is_empty();
+    Ok(WriteReport {
+        address: format!("0x{address:x}"),
+        requested_bytes: bytes.len(),
+        written_bytes: written,
+        requested_base64: base64::engine::general_purpose::STANDARD.encode(bytes),
+        before_base64: base64::engine::general_purpose::STANDARD.encode(before.bytes),
+        readback_base64: base64::engine::general_purpose::STANDARD.encode(&readback),
+        readback_bytes: readback.len(),
+        api_success,
+        complete,
+        partial: !complete,
+        protection_restored,
+        instruction_cache_flushed,
+        errors,
+    })
+}
+
 fn read_memory(process: &Process, address: u64, length: usize) -> Result<Memory> {
     if length > 65536 {
         bail!("memory read exceeds 65536-byte bound");
@@ -1605,6 +2611,16 @@ fn read_memory(process: &Process, address: u64, length: usize) -> Result<Memory>
     if process.identity.architecture == "x86" && end > (u64::from(u32::MAX) + 1) {
         bail!("memory range exceeds x86 address space");
     }
+    read_native_memory(process, address, length)
+}
+
+fn read_native_memory(process: &Process, address: u64, length: usize) -> Result<Memory> {
+    if length > 65536 {
+        bail!("memory read exceeds 65536-byte bound");
+    }
+    address
+        .checked_add(length as u64)
+        .context("memory address overflow")?;
     let pointer = usize::try_from(address)
         .context("memory address does not fit the debugger architecture")?;
     let mut bytes = vec![0u8; length];
@@ -2134,7 +3150,10 @@ mod tests {
             default_exception_status(0xc0000005),
             DBG_EXCEPTION_NOT_HANDLED
         );
-        assert_eq!(default_exception_status(0x80000003), DBG_CONTINUE);
+        assert_eq!(
+            default_exception_status(0x80000003),
+            DBG_EXCEPTION_NOT_HANDLED
+        );
     }
 
     #[test]

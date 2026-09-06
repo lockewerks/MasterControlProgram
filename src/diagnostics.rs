@@ -243,6 +243,67 @@ pub struct DebugEvaluateInput {
     pub timeout_ms: Option<u64>,
 }
 
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct DebugMemoryWriteInput {
+    pub id: String,
+    #[serde(deserialize_with = "crate::coerce::num")]
+    pub stop_id: u64,
+    #[serde(deserialize_with = "crate::coerce::num")]
+    pub address: u64,
+    #[schemars(description = "1-65536 replacement bytes, base64 encoded.")]
+    pub bytes_base64: String,
+    #[schemars(
+        description = "Required exact current bytes, same length, base64 encoded. No automatic retry after a partial outcome."
+    )]
+    pub expected_base64: String,
+    #[serde(default, deserialize_with = "crate::coerce::opt_num")]
+    pub timeout_ms: Option<u64>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(tag = "action", rename_all = "snake_case")]
+pub enum BreakpointAction {
+    List,
+    Add {
+        #[serde(deserialize_with = "crate::coerce::num")]
+        address: u64,
+        #[serde(deserialize_with = "crate::coerce::num")]
+        expected_byte: u8,
+    },
+    Enable {
+        #[serde(deserialize_with = "crate::coerce::num")]
+        address: u64,
+    },
+    Disable {
+        #[serde(deserialize_with = "crate::coerce::num")]
+        address: u64,
+    },
+    Remove {
+        #[serde(deserialize_with = "crate::coerce::num")]
+        address: u64,
+    },
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct DebugBreakpointInput {
+    pub id: String,
+    #[serde(deserialize_with = "crate::coerce::num")]
+    pub stop_id: u64,
+    #[serde(flatten)]
+    pub action: BreakpointAction,
+    #[serde(default, deserialize_with = "crate::coerce::opt_num")]
+    pub timeout_ms: Option<u64>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct DebugStepInput {
+    pub id: String,
+    #[serde(deserialize_with = "crate::coerce::num")]
+    pub stop_id: u64,
+    #[serde(default, deserialize_with = "crate::coerce::opt_num")]
+    pub timeout_ms: Option<u64>,
+}
+
 fn bounded(
     value: Option<usize>,
     default: usize,
@@ -603,6 +664,79 @@ impl MasterControlProgram {
             .await,
         )
     }
+
+    #[tool(
+        description = "Write guarded process memory in the exact stopped debugger session. Requires matching expected bytes, excludes owned breakpoint addresses, and reports requested/written/readback bytes and partial failures. Native success is not application completion."
+    )]
+    async fn debug_memory_write(
+        &self,
+        Parameters(input): Parameters<DebugMemoryWriteInput>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        response(
+            request(context, input.timeout_ms, |deadline| {
+                self.diagnostics.command(
+                    &input.id,
+                    &self.diagnostics_connection,
+                    debugger::Command::WriteMemory {
+                        stop_id: input.stop_id,
+                        address: input.address,
+                        bytes_base64: input.bytes_base64,
+                        expected_base64: input.expected_base64,
+                    },
+                    deadline,
+                )
+            })
+            .await,
+        )
+    }
+
+    #[tool(
+        description = "Add/list/enable/disable/remove software breakpoints by exact address while stopped. Up to 128 distinct addresses per session, including removed addresses retained for queued trap cleanup and excluded from memory writes until detach. Add requires the original expected byte and rejects existing INT3. Supports x86/x64/WOW64 executable memory. Continue steps over owned hits with other threads suspended, then reinstalls enabled breakpoints."
+    )]
+    async fn debug_breakpoint(
+        &self,
+        Parameters(input): Parameters<DebugBreakpointInput>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        response(
+            request(context, input.timeout_ms, |deadline| {
+                self.diagnostics.command(
+                    &input.id,
+                    &self.diagnostics_connection,
+                    debugger::Command::Breakpoint {
+                        stop_id: input.stop_id,
+                        action: input.action,
+                    },
+                    deadline,
+                )
+            })
+            .await,
+        )
+    }
+
+    #[tool(
+        description = "Single-step the exact stopped event thread on x86/x64/WOW64. Other target threads are held only for this step. Observe the next stop/events; acceptance is not step completion. Existing trap flags are rejected."
+    )]
+    async fn debug_step(
+        &self,
+        Parameters(input): Parameters<DebugStepInput>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        response(
+            request(context, input.timeout_ms, |deadline| {
+                self.diagnostics.command(
+                    &input.id,
+                    &self.diagnostics_connection,
+                    debugger::Command::Step {
+                        stop_id: input.stop_id,
+                    },
+                    deadline,
+                )
+            })
+            .await,
+        )
+    }
 }
 
 #[cfg(test)]
@@ -634,6 +768,9 @@ mod tests {
             "debug_terminate",
             "debug_command",
             "debug_evaluate",
+            "debug_memory_write",
+            "debug_breakpoint",
+            "debug_step",
         ]
         .into_iter()
         .map(str::to_string)
@@ -646,6 +783,28 @@ mod tests {
 
     #[test]
     fn numeric_string_inputs_keep_exact_identity_and_bounds() {
+        let breakpoint: DebugBreakpointInput = serde_json::from_value(serde_json::json!({
+            "id": "session", "stop_id": "9007199254740993", "action": "add",
+            "address": "9007199254740992", "expected_byte": "144"
+        }))
+        .unwrap();
+        assert_eq!(breakpoint.stop_id, 9007199254740993);
+        assert!(matches!(
+            breakpoint.action,
+            BreakpointAction::Add {
+                address: 9007199254740992,
+                expected_byte: 144
+            }
+        ));
+        assert!(serde_json::from_value::<DebugBreakpointInput>(serde_json::json!({
+            "id": "session", "stop_id": "1", "action": "add", "address": "4096", "expected_byte": "256"
+        })).is_err());
+        assert!(
+            serde_json::from_value::<DebugMemoryWriteInput>(serde_json::json!({
+                "id": "session", "stop_id": "1", "address": "4096", "bytes_base64": "kA=="
+            }))
+            .is_err()
+        );
         let input: StacksInput = serde_json::from_value(serde_json::json!({
             "pid": "123", "creation_time": "133987654321234567", "max_frames": "64", "timeout_ms": "2000"
         })).unwrap();

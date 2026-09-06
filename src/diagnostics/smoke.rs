@@ -8,6 +8,8 @@ use windows::core::PCWSTR;
 use windows::Win32::Foundation::*;
 use windows::Win32::Storage::FileSystem::GetFileType;
 use windows::Win32::System::Diagnostics::Debug::{CheckRemoteDebuggerPresent, OutputDebugStringW};
+use windows::Win32::System::Diagnostics::Debug::{FlushInstructionCache, ReadProcessMemory};
+use windows::Win32::System::Memory::*;
 use windows::Win32::System::Threading::*;
 
 use super::debugger::{Command as DebugCommand, SessionView, State};
@@ -46,7 +48,47 @@ fn child_fixture() {
     }
 }
 
-pub(super) struct ChildFixture(Child);
+#[test]
+#[ignore = "editing subprocess fixture, requires MCP_DIAGNOSTICS_EDIT_CHILD"]
+fn editing_child_fixture() {
+    if std::env::var_os("MCP_DIAGNOSTICS_EDIT_CHILD").is_none()
+        || !std::env::args().any(|arg| arg == "--exact")
+    {
+        return;
+    }
+    unsafe {
+        let code = VirtualAlloc(None, 4096, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+        let data = VirtualAlloc(None, 4096, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+        assert!(!code.is_null() && !data.is_null());
+        std::ptr::copy_nonoverlapping([0x90u8, 0xc3].as_ptr(), code.cast(), 2);
+        std::ptr::write_bytes(data.cast::<u8>().add(8), 0x11, 8);
+        let mut old = PAGE_PROTECTION_FLAGS::default();
+        VirtualProtect(code, 4096, PAGE_EXECUTE_READ, &mut old).unwrap();
+        FlushInstructionCache(GetCurrentProcess(), Some(code), 2).unwrap();
+        println!("MCP_EDIT_READY {} {}", code as usize, data as usize);
+        std::io::stdout().flush().unwrap();
+        let code = code as usize;
+        let data = data as usize;
+        let workers: Vec<_> = (0..2)
+            .map(|_| {
+                std::thread::spawn(move || {
+                    let function: unsafe extern "C" fn() = std::mem::transmute(code);
+                    let counter = &*(data as *const std::sync::atomic::AtomicU64);
+                    for _ in 0..12000 {
+                        function();
+                        counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                })
+            })
+            .collect();
+        for worker in workers {
+            worker.join().unwrap();
+        }
+    }
+}
+
+pub(super) struct ChildFixture(Child, Option<String>);
 
 impl ChildFixture {
     pub(super) fn spawn() -> Result<Self> {
@@ -56,16 +98,20 @@ impl ChildFixture {
     }
 
     fn spawn_ready(mut command: Command, marker: &str) -> Result<Self> {
-        command.env_clear().env(
-            "SystemRoot",
-            std::env::var_os("SystemRoot").context("SystemRoot unavailable")?,
-        );
+        command
+            .env_clear()
+            .env("MCP_DIAGNOSTICS_EDIT_CHILD", "1")
+            .env(
+                "SystemRoot",
+                std::env::var_os("SystemRoot").context("SystemRoot unavailable")?,
+            );
         let mut child = Self(
             command
                 .stdin(Stdio::null())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::null())
                 .spawn()?,
+            None,
         );
         let output = child
             .0
@@ -88,22 +134,400 @@ impl ChildFixture {
                         bail!("fixture exited before ready");
                     }
                     if !ready && line.contains(&marker) {
-                        send.send(Ok(()))
+                        send.send(Ok(line.clone()))
                             .context("fixture readiness receiver closed")?;
                         ready = true;
                     }
                 }
             })();
             if !ready {
-                let _ = send.send(result);
+                if let Err(error) = result {
+                    let _ = send.send(Err(error));
+                }
             }
         });
-        receive
-            .recv_timeout(Duration::from_secs(10))
-            .context("fixture readiness timeout")??;
+        child.1 = Some(
+            receive
+                .recv_timeout(Duration::from_secs(10))
+                .context("fixture readiness timeout")??,
+        );
         Ok(child)
     }
+}
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "native editing against a guarded disposable x64 child"]
+#[cfg(target_arch = "x86_64")]
+async fn native_smoke_debugger_editing() -> Result<()> {
+    use base64::Engine;
+    let mut command = Command::new(std::env::current_exe()?);
+    command.args([
+        "--exact",
+        "diagnostics::smoke::editing_child_fixture",
+        "--ignored",
+        "--nocapture",
+    ]);
+    let mut child = ChildFixture::spawn_ready(command, "MCP_EDIT_READY")?;
+    let line = child.1.as_ref().context("editing rendezvous missing")?;
+    let mut fields = line
+        .split_whitespace()
+        .skip_while(|part| *part != "MCP_EDIT_READY")
+        .skip(1);
+    let code: u64 = fields.next().context("missing code address")?.parse()?;
+    let data: u64 = fields.next().context("missing data address")?.parse()?;
+    let target = child.target()?;
+    let process = Process::open(target.pid, Some(target.creation_time), PROCESS_VM_READ)?;
+    let read = |address: u64, length: usize| -> Result<Vec<u8>> {
+        let mut bytes = vec![0; length];
+        let mut count = 0;
+        unsafe {
+            ReadProcessMemory(
+                process.handle.0,
+                address as *const _,
+                bytes.as_mut_ptr().cast(),
+                length,
+                Some(&mut count),
+            )
+        }?;
+        assert_eq!(count, length);
+        Ok(bytes)
+    };
+    let manager = DiagnosticsManager::new(false);
+    manager.register_connection("edit")?;
+    let view = manager
+        .attach(
+            DebugAttachInput {
+                target: target.clone(),
+                lifetime: Lifetime::Connection,
+                event_capacity: Some(512),
+                timeout_ms: None,
+            },
+            "edit",
+            Deadline::new(10000)?,
+        )
+        .await?;
+    let id = view.id;
+    let stopped = state(&manager, &id, "edit", State::Stopped).await?;
+    let stop = stopped.stop.context("missing initial stop")?;
+    assert_eq!(stop.reason, "initial_breakpoint");
+    let send = |command| manager.command(&id, "edit", command, Deadline::new(10000).unwrap());
+    let encoded = |bytes: &[u8]| base64::engine::general_purpose::STANDARD.encode(bytes);
+    assert!(send(DebugCommand::WriteMemory {
+        stop_id: stop.stop_id + 1,
+        address: data + 8,
+        bytes_base64: encoded(&[0x22; 8]),
+        expected_base64: encoded(&[0x11; 8]),
+    })
+    .await
+    .is_err());
+    assert!(send(DebugCommand::WriteMemory {
+        stop_id: stop.stop_id,
+        address: data + 8,
+        bytes_base64: encoded(&[0x22; 8]),
+        expected_base64: encoded(&[0x33; 8]),
+    })
+    .await
+    .is_err());
+    assert_eq!(read(data + 8, 8)?, [0x11; 8]);
+    let written = send(DebugCommand::WriteMemory {
+        stop_id: stop.stop_id,
+        address: data + 8,
+        bytes_base64: encoded(&[0x22; 8]),
+        expected_base64: encoded(&[0x11; 8]),
+    })
+    .await?;
+    assert_eq!(written.data["complete"], true);
+    assert_eq!(written.data["written_bytes"], 8);
+    assert_eq!(written.data["readback_base64"], encoded(&[0x22; 8]));
+    assert_eq!(read(data + 8, 8)?, [0x22; 8]);
+    assert!(!written.application_completion_observed);
+    let denied = serde_json::to_value(debugger::guarded_write(
+        &process,
+        data + 8,
+        &[0x33; 8],
+        &[0x22; 8],
+    )?)?;
+    assert_eq!(denied["api_success"], false);
+    assert_eq!(denied["partial"], true);
+    assert_eq!(denied["written_bytes"], 0);
+    assert_eq!(denied["readback_base64"], encoded(&[0x22; 8]));
+    assert!(denied["errors"]
+        .as_array()
+        .is_some_and(|errors| !errors.is_empty()));
+    assert!(send(DebugCommand::WriteMemory {
+        stop_id: stop.stop_id,
+        address: 0,
+        bytes_base64: encoded(&[1]),
+        expected_base64: encoded(&[0]),
+    })
+    .await
+    .is_err());
+    assert!(send(DebugCommand::WriteMemory {
+        stop_id: stop.stop_id,
+        address: data + 4095,
+        bytes_base64: encoded(&[1, 2]),
+        expected_base64: encoded(&[0, 0]),
+    })
+    .await
+    .is_err());
+    send(DebugCommand::Breakpoint {
+        stop_id: stop.stop_id,
+        action: BreakpointAction::Add {
+            address: code,
+            expected_byte: 0x90,
+        },
+    })
+    .await?;
+    assert_eq!(read(code, 2)?, [0xcc, 0xc3]);
+    assert!(send(DebugCommand::WriteMemory {
+        stop_id: stop.stop_id,
+        address: code,
+        bytes_base64: encoded(&[0x90]),
+        expected_base64: encoded(&[0xcc]),
+    })
+    .await
+    .is_err());
+    for action in [
+        BreakpointAction::Disable { address: code },
+        BreakpointAction::Enable { address: code },
+        BreakpointAction::List,
+    ] {
+        send(DebugCommand::Breakpoint {
+            stop_id: stop.stop_id,
+            action,
+        })
+        .await?;
+    }
+    let mut region = MEMORY_BASIC_INFORMATION::default();
+    unsafe {
+        VirtualQueryEx(
+            process.handle.0,
+            Some(code as *const _),
+            &mut region,
+            std::mem::size_of_val(&region),
+        )
+    };
+    assert_eq!(region.Protect, PAGE_EXECUTE_READ);
+    send(DebugCommand::Continue {
+        stop_id: stop.stop_id,
+        disposition: ContinueDisposition::Default,
+    })
+    .await?;
+    let hit = state(&manager, &id, "edit", State::Stopped)
+        .await?
+        .stop
+        .context("missing owned hit")?;
+    assert_eq!(hit.reason, "software_breakpoint");
+    assert_eq!(hit.breakpoint_address, Some(format!("0x{code:x}")));
+    assert_eq!(read(code, 2)?, [0x90, 0xc3]);
+    let registers = send(DebugCommand::Inspect {
+        stop_id: hit.stop_id,
+        inspection: InspectionCommand::Registers {
+            thread_id: hit.thread_id,
+        },
+    })
+    .await?;
+    assert_eq!(registers.data["registers"]["rip"], format!("0x{code:x}"));
+    let before = read(data, 8)?;
+    send(DebugCommand::Step {
+        stop_id: hit.stop_id,
+    })
+    .await?;
+    let stepped = state(&manager, &id, "edit", State::Stopped)
+        .await?
+        .stop
+        .context("missing single step")?;
+    assert_eq!(stepped.reason, "single_step");
+    assert_eq!(stepped.thread_id, hit.thread_id);
+    assert_eq!(
+        read(data, 8)?,
+        before,
+        "no thread may pass the unpatched instruction during step"
+    );
+    assert_eq!(read(code, 2)?, [0xcc, 0xc3]);
+    send(DebugCommand::Continue {
+        stop_id: stepped.stop_id,
+        disposition: ContinueDisposition::Default,
+    })
+    .await?;
+    let hit = state(&manager, &id, "edit", State::Stopped)
+        .await?
+        .stop
+        .context("missing second owned hit")?;
+    assert_eq!(hit.reason, "software_breakpoint");
+    send(DebugCommand::Continue {
+        stop_id: hit.stop_id,
+        disposition: ContinueDisposition::Default,
+    })
+    .await?;
+    let hit = state(&manager, &id, "edit", State::Stopped)
+        .await?
+        .stop
+        .context("missing reinserted breakpoint hit")?;
+    assert_eq!(hit.reason, "software_breakpoint");
+    send(DebugCommand::Breakpoint {
+        stop_id: hit.stop_id,
+        action: BreakpointAction::Remove { address: code },
+    })
+    .await?;
+    send(DebugCommand::Continue {
+        stop_id: hit.stop_id,
+        disposition: ContinueDisposition::Default,
+    })
+    .await?;
+    state(&manager, &id, "edit", State::Running).await?;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(
+        manager.inspect(&id, "edit")?.state,
+        State::Running,
+        "{:?}",
+        manager.inspect(&id, "edit")?
+    );
+    send(DebugCommand::Break).await?;
+    let stop = state(&manager, &id, "edit", State::Stopped)
+        .await?
+        .stop
+        .context("missing requested stop")?;
+    assert_eq!(stop.reason, "requested_break");
+    send(DebugCommand::Breakpoint {
+        stop_id: stop.stop_id,
+        action: BreakpointAction::Add {
+            address: code,
+            expected_byte: 0x90,
+        },
+    })
+    .await?;
+    // Disconnect with a patched byte and a stopped event must restore and release both.
+    manager.disconnect("edit").await?;
+    assert_not_debugged(&target)?;
+    assert_eq!(read(code, 2)?, [0x90, 0xc3]);
+    let before = read(data, 8)?;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_ne!(
+        read(data, 8)?,
+        before,
+        "disconnect must leave child threads running"
+    );
+    for phase in 0..3 {
+        let manager = DiagnosticsManager::new(false);
+        manager.register_connection("cleanup")?;
+        let view = manager
+            .attach(
+                DebugAttachInput {
+                    target: target.clone(),
+                    lifetime: Lifetime::Connection,
+                    event_capacity: None,
+                    timeout_ms: None,
+                },
+                "cleanup",
+                Deadline::new(10000)?,
+            )
+            .await?;
+        let send =
+            |command| manager.command(&view.id, "cleanup", command, Deadline::new(10000).unwrap());
+        let stop = state(&manager, &view.id, "cleanup", State::Stopped)
+            .await?
+            .stop
+            .context("missing cleanup stop")?;
+        send(DebugCommand::Breakpoint {
+            stop_id: stop.stop_id,
+            action: BreakpointAction::Add {
+                address: code,
+                expected_byte: 0x90,
+            },
+        })
+        .await?;
+        send(DebugCommand::Continue {
+            stop_id: stop.stop_id,
+            disposition: ContinueDisposition::Default,
+        })
+        .await?;
+        if phase != 2 {
+            let hit = state(&manager, &view.id, "cleanup", State::Stopped)
+                .await?
+                .stop
+                .context("missing cleanup hit")?;
+            assert_eq!(hit.reason, "software_breakpoint");
+            if phase == 1 {
+                send(DebugCommand::Step {
+                    stop_id: hit.stop_id,
+                })
+                .await?;
+            }
+        }
+        manager.disconnect("cleanup").await?;
+        assert_not_debugged(&target)?;
+        assert_eq!(read(code, 2)?, [0x90, 0xc3]);
+        let before = read(data, 8)?;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_ne!(
+            read(data, 8)?,
+            before,
+            "cleanup phase {phase} must leave threads running"
+        );
+    }
+    let manager = DiagnosticsManager::new(false);
+    manager.register_connection("changed")?;
+    let view = manager
+        .attach(
+            DebugAttachInput {
+                target: target.clone(),
+                lifetime: Lifetime::Connection,
+                event_capacity: None,
+                timeout_ms: None,
+            },
+            "changed",
+            Deadline::new(10000)?,
+        )
+        .await?;
+    let stop = state(&manager, &view.id, "changed", State::Stopped)
+        .await?
+        .stop
+        .context("missing ownership stop")?;
+    manager
+        .command(
+            &view.id,
+            "changed",
+            DebugCommand::Breakpoint {
+                stop_id: stop.stop_id,
+                action: BreakpointAction::Add {
+                    address: code,
+                    expected_byte: 0x90,
+                },
+            },
+            Deadline::new(5000)?,
+        )
+        .await?;
+    let external = Process::open(
+        target.pid,
+        Some(target.creation_time),
+        PROCESS_VM_READ | PROCESS_VM_WRITE | PROCESS_VM_OPERATION,
+    )?;
+    let changed =
+        serde_json::to_value(debugger::guarded_write(&external, code, &[0x91], &[0xcc])?)?;
+    assert_eq!(changed["complete"], true);
+    let failure = manager
+        .disconnect("changed")
+        .await
+        .expect_err("ownership loss must be reported");
+    assert!(
+        format!("{failure:#}").contains("ownership lost"),
+        "{failure:#}"
+    );
+    assert_not_debugged(&target)?;
+    assert_eq!(
+        read(code, 1)?,
+        [0x91],
+        "cleanup must not overwrite another writer's byte"
+    );
+    let before = read(data, 8)?;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_ne!(read(data, 8)?, before);
+    child.finish()?;
+    Ok(())
+}
+
+impl ChildFixture {
     pub(super) fn target(&self) -> Result<TargetInput> {
         let process = Process::open(self.0.id(), None, PROCESS_ACCESS_RIGHTS(0))?;
         Ok(TargetInput {
@@ -809,8 +1233,154 @@ async fn native_smoke_wow64_stacks_dump_and_debug_registers() -> Result<()> {
         registers.data["registers"]["eip"].as_str().is_some(),
         "{registers:?}"
     );
+    let editing = Process::open(
+        target.pid,
+        Some(target.creation_time),
+        PROCESS_CREATE_THREAD | PROCESS_VM_OPERATION | PROCESS_VM_WRITE | PROCESS_VM_READ,
+    )?;
+    // Only this disposable child receives the test rendezvous. Its x86 thread
+    // increments a counter so detach proves execution resumes without INT3.
+    let code = unsafe {
+        VirtualAllocEx(
+            editing.handle.0,
+            None,
+            4096,
+            MEM_COMMIT | MEM_RESERVE,
+            PAGE_EXECUTE_READWRITE,
+        )
+    };
+    assert!(!code.is_null());
+    let address = code as u64;
+    let counter = u32::try_from(address + 128)?;
+    let mut bytes = vec![0x90, 0xff, 0x05];
+    bytes.extend(counter.to_le_bytes());
+    bytes.extend([0xeb, 0xf7]);
+    unsafe {
+        windows::Win32::System::Diagnostics::Debug::WriteProcessMemory(
+            editing.handle.0,
+            code,
+            bytes.as_ptr().cast(),
+            bytes.len(),
+            None,
+        )?;
+        FlushInstructionCache(editing.handle.0, Some(code), bytes.len())?;
+    }
+    let thread = Handle(unsafe {
+        CreateRemoteThread(
+            editing.handle.0,
+            None,
+            0,
+            Some(std::mem::transmute::<
+                *mut std::ffi::c_void,
+                unsafe extern "system" fn(*mut std::ffi::c_void) -> u32,
+            >(code)),
+            None,
+            CREATE_SUSPENDED.0,
+            None,
+        )
+    }?);
+    manager
+        .command(
+            &view.id,
+            "wow64",
+            DebugCommand::Breakpoint {
+                stop_id: stop.stop_id,
+                action: BreakpointAction::Add {
+                    address,
+                    expected_byte: 0x90,
+                },
+            },
+            Deadline::new(5000)?,
+        )
+        .await?;
+    assert_ne!(unsafe { ResumeThread(thread.0) }, u32::MAX);
+    let mut current = stop;
+    for _ in 0..4 {
+        manager
+            .command(
+                &view.id,
+                "wow64",
+                DebugCommand::Continue {
+                    stop_id: current.stop_id,
+                    disposition: ContinueDisposition::Default,
+                },
+                Deadline::new(5000)?,
+            )
+            .await?;
+        current = state(&manager, &view.id, "wow64", State::Stopped)
+            .await?
+            .stop
+            .context("WOW64 editing stop missing")?;
+        if current.reason == "software_breakpoint" {
+            break;
+        }
+        assert!(
+            matches!(
+                current.reason,
+                "initial_breakpoint" | "wow64_initial_breakpoint"
+            ),
+            "{current:?}"
+        );
+    }
+    assert_eq!(current.reason, "software_breakpoint");
+    assert_eq!(current.breakpoint_address, Some(format!("0x{address:x}")));
+    manager
+        .command(
+            &view.id,
+            "wow64",
+            DebugCommand::Step {
+                stop_id: current.stop_id,
+            },
+            Deadline::new(5000)?,
+        )
+        .await?;
+    let stepped = state(&manager, &view.id, "wow64", State::Stopped)
+        .await?
+        .stop
+        .context("WOW64 step stop missing")?;
+    assert_eq!(stepped.reason, "single_step");
+    let registers = manager
+        .command(
+            &view.id,
+            "wow64",
+            DebugCommand::Inspect {
+                stop_id: stepped.stop_id,
+                inspection: InspectionCommand::Registers {
+                    thread_id: stepped.thread_id,
+                },
+            },
+            Deadline::new(5000)?,
+        )
+        .await?;
+    assert_eq!(
+        registers.data["registers"]["eip"],
+        format!("0x{:x}", address + 1)
+    );
     manager.disconnect("wow64").await?;
     assert_not_debugged(&target)?;
+    let mut restored = 0u8;
+    unsafe {
+        ReadProcessMemory(
+            editing.handle.0,
+            code,
+            (&mut restored as *mut u8).cast(),
+            1,
+            None,
+        )
+    }?;
+    assert_eq!(restored, 0x90);
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    let mut counted = 0u32;
+    unsafe {
+        ReadProcessMemory(
+            editing.handle.0,
+            counter as *const _,
+            (&mut counted as *mut u32).cast(),
+            4,
+            None,
+        )
+    }?;
+    assert_ne!(counted, 0);
     child.finish()?;
     Ok(())
 }
