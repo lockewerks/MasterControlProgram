@@ -71,6 +71,81 @@ Enforcement isn't a process, it's just me. If someone is being a problem, open a
 issue or email archon@lockewerks.com. I'll deal with it, and I'll err on the side
 of the person getting treated badly.
 
+## Development
+
+Use Windows 11 and the stable Rust MSVC toolchain. PowerShell 7 is needed for
+provider-backed tools and the installer script. Native functionality requires
+the corresponding installed Windows provider and actual token permissions.
+Do not enable optional features or change system configuration just to make
+a test pass.
+
+```powershell
+cargo check -j1 --tests
+cargo test -j1
+cargo clippy -j1 --all-targets -- -D warnings
+```
+
+Prefer the smallest relevant existing test selector while developing. For the
+diagnostics unit tests and disposable native fixtures:
+
+```powershell
+cargo test -j1 --bin MasterControlProgram diagnostics:: -- --include-ignored --test-threads=1
+```
+
+Do not run every ignored test against a working desktop indiscriminately.
+Read each fixture's prerequisites and use disposable targets. Subprocess helper
+tests must remain inert when a broad test command selects them without their
+explicit activation conditions.
+
+## Code and documentation layout
+
+| Area | Location |
+|------|----------|
+| Base tools and router composition | `src/server.rs` |
+| Audio provider tools | `src/provider_tools.rs`, `src/win32/audio.rs` |
+| Desktop, windows, UI Automation and OCR | `src/desktop.rs`, `src/desktop/` |
+| ConPTY terminals and owned jobs | `src/execution.rs`, `src/execution/` |
+| Watches, waits and ETW | `src/observation.rs`, `src/observation/` |
+| Deterministic workflows | `src/workflow.rs`, `src/workflow/` |
+| File/service editing | `src/system_control.rs`, `src/win32/filesystem.rs`, `src/win32/service.rs` |
+| Network, virtualization, devices and storage | `src/administration.rs`, `src/win32/` |
+| Process diagnostics and debugger actors | `src/diagnostics.rs`, `src/diagnostics/` |
+| Local host, connection cleanup and identity | `src/host.rs`, `src/host/`, `src/connection.rs`, `src/context.rs` |
+| General native runtime and PowerShell pool | `src/runtime.rs`, `src/ps/` |
+| MCP integration tests | `tests/mcp.rs` |
+| User documentation | [README.md](README.md), [control guide](docs/control-guide.md) |
+
+A tool added to a separate named router must be included in the composed
+router in `src/server.rs`. Updating only the original router does not cover
+every tool family.
+
+Preserve exact-target preconditions and numeric-string coercion where used.
+Distinguish native acceptance from observed completion. Bound work and output,
+report partial failures, and balance only the handles, suspensions and process
+trees the operation owns. Cancellation must not silently retry a mutation.
+Connection cleanup and explicitly persistent-host behavior need separate cases.
+
+When changing a tool contract, update its schema description, the README catalog
+and the relevant control-guide section. Document identity requirements, lifetime,
+partial outcomes and unsupported cases. Do not infer current performance from
+old PowerShell timings or advertise unimplemented operations.
+
+## Release workflow
+
+CI builds the release binary and runs clippy on pushes to `master`, pull
+requests and explicit dispatches. It does not run the native test suite, so run
+the relevant tests before publishing a code change.
+
+Keep the package version in `Cargo.toml`/`Cargo.lock` and the product version in
+`installer.toml` aligned. A pushed `v*` tag triggers the existing release
+workflow: build the server, sign it, build the Forge installer from the signed
+payload, sign the installer, verify both signatures and the installer container,
+then publish both executable assets.
+
+An explicit dispatch of the release workflow uploads artifacts without
+publishing a GitHub release. Source builds and `install.ps1` do not sign binaries.
+Do not put signing credentials in source, logs or documentation.
+
 ## Licensing
 
 By contributing you agree your contribution is licensed under the same terms as

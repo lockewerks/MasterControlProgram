@@ -4,11 +4,11 @@
 
 # MasterControlProgram
 
-**The Windows 11 system MCP server that every other MCP server wishes it was.**
+**Local control of Windows over MCP.**
 
 [![release](https://img.shields.io/github/v/release/lockewerks/MasterControlProgram?style=flat-square&color=d6262a)](https://github.com/lockewerks/MasterControlProgram/releases)
 [![license](https://img.shields.io/badge/license-MIT-d6262a?style=flat-square)](LICENSE)
-![platform](https://img.shields.io/badge/platform-Windows%2011-d6262a?style=flat-square)
+[![platform](https://img.shields.io/badge/platform-Windows%2011-d6262a?style=flat-square)](#requirements)
 
 </div>
 
@@ -16,9 +16,13 @@
 
 > *"End of line."*
 
-The Windows 11 system MCP server that every other MCP server wishes it was.
+**199 tools in v1.5.0.** Native Windows administration, desktop observation and
+input, addressable terminals and jobs, event recording, deterministic workflows,
+and process diagnostics with guarded debugger editing.
 
-**98 tools. 19 categories. 37 direct Win32 syscalls. Sub-millisecond response times. Full autonomous computer use.** Built in Rust because we're not here to fuck around with Node.js startup times and PowerShell's "please wait while I load the entire .NET runtime to tell you what your CPU is called."
+The [control guide](docs/control-guide.md) covers the features added in v1.4.0
+and v1.5.0, including exact-target identities, connection and host lifetimes,
+partial results, and examples. MCP `tools/list` supplies the current input schemas.
 
 ---
 
@@ -57,12 +61,16 @@ The Windows 11 system MCP server that every other MCP server wishes it was.
 | Tool | What it looks like on a bad day |
 |------|--------------------------------|
 | `registry_delete` | Deletes registry keys. Some of those keys are how Windows boots. |
-| `powershell_execute` / `cmd_execute` | Arbitrary code, elevated. There is no file on the disk it cannot reach. |
+| `powershell_execute` / `cmd_execute` | Arbitrary code under the server's token, including destructive administrative commands. |
 | `service_stop` / `service_set_startup` | Defender off. Firewall service off. Backup agent off. Permanently. |
 | `user_create` / `group_add_member` | A brand new local administrator that outlives uninstalling this. |
 | `firewall_rule_create` | A hole punched to the internet, on a box that now has an extra admin on it. |
 | `keyboard_type` / `mouse_click` | Types and clicks in whatever window is focused, including the one with your bank in it. |
 | `screen_capture` | Ships a picture of your screen to a cloud model. Password manager open? That went too. |
+| `fs_write` / `fs_acl_modify` / `fs_owner_set` | Replaces files or changes who can access them. Conditional writes do not make the requested change safe. |
+| `debug_memory_write` / `debug_breakpoint` | Changes another process's memory or stops its threads. A bad edit can crash or corrupt that process. |
+| `device_set_state` / `network_address_set` / `volume_set` | Can disconnect devices, remove connectivity, or change mounted paths. |
+| `audio_record` | Records microphone input or playback loopback to a WAV file. |
 
 The screen edges glow red while it is driving the mouse or the keyboard. That
 is a notification, not a permission prompt: by the time you see it, it already
@@ -127,59 +135,85 @@ lunatic. You are our kind of unhinged. Take the snapshot. Watch the log.
 
 ## What the hell is this?
 
-An [MCP (Model Context Protocol)](https://modelcontextprotocol.io) server that gives AI assistants **full system control** over Windows 11. Not just system management, but **full autonomous computer use**. Screen capture, mouse control, keyboard input, plus processes, services, registry, firewall, network, the whole goddamn operating system.
+An [MCP (Model Context Protocol)](https://modelcontextprotocol.io) server for
+Windows system administration and desktop control. It exposes typed tools through
+local stdio, or through a stdio bridge to an explicitly started local host.
 
 It runs under any MCP client that can launch a local stdio server, and it writes
-itself into the two that need a config file edited: Claude Desktop, and the
-OpenAI Codex host behind the ChatGPT desktop app, the Codex CLI and the Codex
-IDE extension. See [Install](#install).
+itself into Claude Desktop, Claude Code, and the OpenAI Codex host behind the
+ChatGPT desktop app, Codex CLI and Codex IDE extension. See [Install](#install).
 
-Other Windows MCP servers use PowerShell for everything and make you wait 1-2 seconds per tool call. We call Win32 APIs directly from Rust. Our `process_list` runs in **9ms**. Our `memory_info` runs in **<1ms**. Their equivalent takes **1,500ms**. Do the math, then go look at what your current server is doing with that second and a half.
+Tools operate under the actual Windows token and desktop. Administrator access
+does not bypass protected processes, secure desktops, provider availability, or
+application restrictions. An accepted API call is not proof that the requested
+application operation completed.
 
-## Architecture (or: Why This Is Fast)
+## Architecture
 
-```
-┌─────────────────────────────────────────────────────────┐
-│  MasterControlProgram.exe (Rust binary)                 │
-│                                                         │
-│  37 tools ──→ Direct Win32 syscalls ──→ <1ms response   │
-│              CreateToolhelp32Snapshot, OpenSCManagerW,  │
-│              RegOpenKeyExW, GetTcpTable2, SendInput,    │
-│              BitBlt (screen capture), etc.              │
-│                                                         │
-│  61 tools ──→ Persistent PowerShell pool ──→ 200-1500ms │
-│              3x pre-warmed pwsh.exe processes           │
-│              (for COM-only APIs Win32 can't touch)      │
-└─────────────────────────────────────────────────────────┘
+```text
+MCP client
+  -> local stdio server
+     or stdio bridge -> authenticated local named-pipe host
+  -> typed tool routers
+     -> native Windows APIs, COM and WinRT
+     -> bounded native actors for terminals, events and debugging
+     -> lazy, bounded PowerShell workers for remaining providers/scripts
 ```
 
-**Native Win32 tools (37):** Process management, services, registry, filesystem, network connections, system info, clipboard, disk info, **screen capture, mouse control, keyboard input**, all via direct syscalls. No subprocess. No serialization overhead. Just raw speed.
+Native paths include firewall and event-log access, Task Scheduler, account
+management, Core Audio, UI Automation, OCR, file and service mutation, IP Helper,
+SetupAPI, virtual disks, and Windows debugging APIs. Some tools retain explicit
+provider or compatibility paths; there is no fixed native-versus-PowerShell
+split across every input.
 
-**PowerShell pool tools (61):** Firewall rules, scheduled tasks, event logs, user management, Windows features, audio, updates. All stuck behind COM/WMI interfaces that only PowerShell can reach without losing your mind. The pool keeps 3 `pwsh.exe` processes warm so at least you're not paying the startup tax every single call.
+PowerShell workers start on demand and are reused up to `MCP_POOL_SIZE`.
+Acquisition, startup, writes and execution have separate bounds. Native work is
+also bounded; cancellation cannot forcibly interrupt every Windows provider.
+Already accepted mutations may finish after a caller timeout and must not be
+retried blindly.
 
-## The 98 Tools
+## Tool catalog
 
-| Category | Count | Backend | Tools |
-|----------|-------|---------|-------|
-| **System Info** | 7 | Native + PS | `system_info` `cpu_info` `memory_info` `disk_info` `gpu_info` `battery_info` `network_adapters` |
-| **Process** | 5 | Native | `process_list` `process_detail` `process_kill` `process_start` `process_tree` |
-| **Service** | 6 | Native | `service_list` `service_detail` `service_start` `service_stop` `service_restart` `service_set_startup` |
-| **Filesystem** | 8 | Native + PS | `fs_list` `fs_search` `fs_info` `fs_permissions` `fs_streams` `fs_drives` `fs_share_list` `fs_share_create` |
-| **Registry** | 6 | Native + PS | `registry_read` `registry_write` `registry_delete` `registry_list` `registry_search` `registry_export` |
-| **Network** | 8 | Native + PS | `network_connections` `network_config` `network_ping` `network_dns_lookup` `network_trace_route` `network_port_test` `network_wifi` `network_bandwidth` |
-| **Firewall** | 5 | PS | `firewall_rules_list` `firewall_rule_create` `firewall_rule_delete` `firewall_rule_toggle` `firewall_status` |
-| **Event Log** | 4 | PS | `eventlog_query` `eventlog_sources` `eventlog_stats` `eventlog_clear` |
-| **Scheduled Tasks** | 6 | PS | `task_list` `task_detail` `task_create` `task_delete` `task_run` `task_toggle` |
-| **Software** | 3 | PS | `software_list` `software_detail` `software_uninstall` |
-| **Users & Groups** | 9 | PS | `user_list` `user_detail` `user_create` `user_delete` `user_modify` `group_list` `group_members` `group_add_member` `group_remove_member` |
-| **Environment** | 7 | PS | `env_list` `env_get` `env_set` `env_delete` `path_list` `path_add` `path_remove` |
-| **PowerShell/CMD/WMI** | 3 | PS | `powershell_execute` `cmd_execute` `wmi_query` |
-| **Windows Features** | 3 | PS | `feature_list` `feature_enable` `feature_disable` |
-| **Clipboard** | 2 | Native | `clipboard_get` `clipboard_set` |
-| **Display & Audio** | 3 | Native + PS | `display_info` `audio_devices` `audio_volume` |
-| **Performance** | 3 | Native + PS | `perf_snapshot` `perf_top` `perf_counter` |
-| **Windows Update** | 2 | PS | `update_list` `update_history` |
-| **Computer Use** | 8 | Native | `screen_capture` `cursor_position` `mouse_move` `mouse_click` `mouse_scroll` `mouse_drag` `keyboard_type` `keyboard_key` |
+All 199 registered tool names are listed below. Use the input schema returned by
+your server for action enums, required identities, supported scopes and bounds.
+Numeric fields with coercion accept decimal strings, which avoids rounding large
+Windows identities in clients that cannot represent every 64-bit integer.
+
+| Category | Tools |
+|----------|-------|
+| System information | `system_info` `cpu_info` `memory_info` `disk_info` `gpu_info` `battery_info` `network_adapters` |
+| Processes | `process_list` `process_detail` `process_kill` `process_start` `process_tree` |
+| Services | `service_list` `service_detail` `service_start` `service_stop` `service_restart` `service_set_startup` `service_create` `service_configure` `service_delete` `service_control` |
+| File inspection and shares | `fs_list` `fs_search` `fs_info` `fs_permissions` `fs_streams` `fs_drives` `fs_share_list` `fs_share_create` |
+| File editing and security | `fs_read` `fs_write` `fs_patch` `fs_copy` `fs_move` `fs_link_create` `fs_link_inspect` `fs_link_remove` `fs_security` `fs_acl_modify` `fs_owner_set` `fs_locks` |
+| Registry | `registry_read` `registry_write` `registry_delete` `registry_list` `registry_search` `registry_export` |
+| Network inspection | `network_connections` `network_config` `network_ping` `network_dns_lookup` `network_trace_route` `network_port_test` `network_wifi` `network_bandwidth` |
+| Network configuration | `network_interfaces` `network_addresses` `network_address_set` `network_routes` `network_route_set` `network_dns_config` `network_adapter_set_state` `network_dhcp_config` `network_proxy_config` `network_wifi_profiles` `network_wifi_connect` |
+| Firewall | `firewall_rules_list` `firewall_rule_create` `firewall_rule_delete` `firewall_rule_toggle` `firewall_status` |
+| Event logs | `eventlog_query` `eventlog_sources` `eventlog_stats` `eventlog_clear` |
+| Scheduled tasks | `task_list` `task_detail` `task_create` `task_delete` `task_run` `task_toggle` |
+| Software | `software_list` `software_detail` `software_uninstall` |
+| Users and groups | `user_list` `user_detail` `user_create` `user_delete` `user_modify` `group_list` `group_members` `group_add_member` `group_remove_member` |
+| Environment | `env_list` `env_get` `env_set` `env_delete` `path_list` `path_add` `path_remove` |
+| Commands and Windows features | `powershell_execute` `cmd_execute` `wmi_query` `feature_list` `feature_enable` `feature_disable` |
+| Clipboard, display and audio | `clipboard_get` `clipboard_set` `display_info` `audio_devices` `audio_volume` `audio_meter` `audio_sessions` `audio_session_volume` `audio_record` |
+| Performance and updates | `perf_snapshot` `perf_top` `perf_counter` `update_list` `update_history` |
+| Pointer and keyboard | `screen_capture` `cursor_position` `mouse_move` `mouse_click` `mouse_scroll` `mouse_drag` `keyboard_type` `keyboard_key` |
+| Desktop observation and UI Automation | `desktop_snapshot` `desktop_ocr` `ui_find` `ui_invoke` `ui_set_value` `ui_text` `ui_wait` `desktop_cancel` `window_list` `window_find` `window_manage` |
+| Execution context and host | `execution_context` `host_shutdown` |
+| Terminals | `terminal_create` `terminal_input` `terminal_read` `terminal_resize` `terminal_interrupt` `terminal_close` `terminal_list` |
+| Jobs | `job_start` `job_inspect` `job_output` `job_wait` `job_cancel` `job_list` |
+| Observation and traces | `watch_create` `watch_remove` `events_read` `wait_for` `wait_status` `wait_list` `wait_cancel` `trace_start` `trace_stop` |
+| Workflows | `workflow_start` `workflow_status` `workflow_list` `workflow_cancel` `workflow_wait` |
+| Virtualization | `wsl_instances` `wsl_manage` `hyperv_instances` `hyperv_manage` |
+| Devices and drivers | `device_list` `device_set_state` `driver_list` `driver_package` |
+| Volumes and disk images | `volume_list` `volume_set` `virtual_disk` |
+| Process diagnostics | `diagnostics_process` `process_dump` `process_stacks` `process_wait_chain` `process_handles` |
+| Debugger lifecycle and inspection | `debug_attach` `debug_launch` `debug_list` `debug_inspect` `debug_events` `debug_continue` `debug_break` `debug_detach` `debug_terminate` `debug_command` `debug_evaluate` |
+| Debugger editing | `debug_memory_write` `debug_breakpoint` `debug_step` |
+
+The [control guide](docs/control-guide.md) explains how to use the new tool
+families without confusing accepted commands with observed results.
 
 ### Computer Use: Full Autonomous Desktop Control
 
@@ -203,12 +237,16 @@ All mouse movement uses **ease-in-out cubic interpolation**. The cursor accelera
 > Installing this puts an unsupervised, self-elevating admin agent on the machine
 > you are sitting at. Install it on something you can afford to lose.
 
-### Prerequisites
+### Requirements
 
 - **Windows 11 24H2 or newer** (build 26100+), required for sudo
-- **PowerShell 7+** (`winget install Microsoft.PowerShell`)
+- **PowerShell 7+** (`winget install Microsoft.PowerShell`) for PowerShell-backed tools
 - **sudo for Windows in Inline mode**, see [Elevation](#elevation-or-how-we-stopped-asking-nicely)
-- **Rust** (`winget install Rustlang.Rustup`), only needed to build from source
+- **Rust stable and the MSVC C++ build tools**, only needed to build from source
+
+WSL, Hyper-V, audio devices, OCR languages and other optional Windows providers
+must already be available for their corresponding tools. Missing providers are
+reported, not installed automatically.
 
 ### Install
 
@@ -247,6 +285,7 @@ registration on its own:
 ```powershell
 MasterControlProgram.exe --register                 # everything installed
 MasterControlProgram.exe --register-claude-desktop  # Claude Desktop
+MasterControlProgram.exe --register-claude-code     # Claude Code
 MasterControlProgram.exe --register-chatgpt         # ChatGPT / Codex
 MasterControlProgram.exe --register-claude-desktop --register-chatgpt   # both
 ```
@@ -280,13 +319,13 @@ cd MasterControlProgram
 .\install.ps1
 ```
 
-The dev loop: builds, murders any running instance, installs, and registers with
-whichever clients are installed. Safe to re-run, which is how you pick up a
-rebuild. `-SkipBuild` installs whatever is already in `target\`, and `-Clients`
+The script builds, stops existing installed instances, installs, and registers
+with whichever clients are installed. Stopping instances also ends their live
+host resources. `-SkipBuild` installs whatever is already in `target\`, and `-Clients`
 takes `auto` (default), `claude`, `chatgpt`, `both`, or `none`.
 
-`cargo build --release` alone drops the binary at
-`target/release/MasterControlProgram.exe` (4.4MB, stripped, LTO'd). Registering
+`cargo build --release -j1` alone drops the binary at
+`target\release\MasterControlProgram.exe`. Registering
 that path directly works right up until cargo tries to overwrite a binary your
 client has open, at which point every rebuild fails until you disconnect. Use
 the installer.
@@ -375,6 +414,29 @@ Note the single quotes. Double quotes make it a TOML basic string, where every
 backslash starts an escape, so a Windows path either fails to parse or quietly
 becomes a different path. Single quotes take it literally.
 
+### Explicit local host
+
+Default startup serves one stdio connection. For resources that must outlive a
+client disconnect, start a host explicitly and connect through a separate
+bridge:
+
+```powershell
+MasterControlProgram.exe --local-host work
+# In a separate process with the same Windows token and executable:
+MasterControlProgram.exe --connect-host work
+```
+
+The bridge never starts or elevates a host. Host and bridge must match the
+required user, logon/session and token context; a normal unelevated client cannot
+silently connect to an elevated host. The named pipe rejects remote clients.
+`--host-state-dir C:\absolute\path` may be supplied with `--local-host`.
+
+Resources still default to `lifetime: "connection"`. Request `"persistent"`
+explicitly for a supported resource, and inspect `execution_context` to confirm
+availability. Persistence preserves supported history across host restarts, not
+live processes or debugger state. No mutation is replayed after restart.
+See [lifetimes](docs/control-guide.md#lifetimes-and-result-semantics).
+
 ## Monitoring
 
 Every tool call is logged to `%TEMP%\MasterControlProgram.log` with timestamps, tool names, execution times, and error details.
@@ -402,28 +464,34 @@ Sample output:
 | Env Variable | Default | Description |
 |-------------|---------|-------------|
 | `MCP_POOL_SIZE` | `3` | Number of persistent PowerShell workers |
+| `MCP_PS_TIMEOUT_MS` | `30000` | PowerShell operation deadline, 1-3600000 ms |
+| `MCP_PS_ACQUIRE_TIMEOUT_MS` | `30000` | PowerShell worker acquisition deadline, 1-3600000 ms |
+| `MCP_PS_WRITE_TIMEOUT_MS` | `10000` | PowerShell input-write deadline, 1-3600000 ms |
+| `MCP_PS_STARTUP_TIMEOUT_MS` | `15000` | PowerShell worker startup deadline, 1-3600000 ms |
+| `MCP_NATIVE_CONCURRENCY` | `8` | General native worker capacity, 1-64; desktop input is serialized separately |
+| `MCP_NATIVE_ACQUIRE_TIMEOUT_MS` | `30000` | General native capacity acquisition deadline, 1-3600000 ms |
+| `MCP_NATIVE_TIMEOUT_MS` | `30000` | Default general native operation deadline, 1-3600000 ms; tool-specific deadlines may override it |
 | `RUST_LOG` | `info` | Log level (`debug`, `info`, `warn`, `error`) |
 | `MCP_ALLOW_UNELEVATED` | unset | Set to `1` to limp along without admin instead of refusing to start when sudo is unavailable. Admin-only tools will fail. Debugging aid, not a way of life. |
 | `MCP_OVERLAY` | on | Red glow around the screen edges while it is driving the mouse or the keyboard. Set to `0` to disable. |
 | `MCP_OVERLAY_INTENSITY` | `115` | Peak alpha of that glow, 0-255. Turn it down if it is distracting, rather than off. |
 | `MCP_OVERLAY_AFFINITY` | unset | Set to `exclude` to hide the glow from screen capture via `WDA_EXCLUDEFROMCAPTURE`. Off by default because on a virtual or indirect display that flag hides it from you as well. |
 
-## Performance
+`MCP_POOL_SIZE` accepts 1-16. Invalid numeric settings fail initialization.
+The general runtime settings do not replace debugger, execution, recording or
+workflow-specific bounds. Check each tool schema before setting a deadline.
 
-Measured on AMD Ryzen AI 9 HX 370, Windows 11 Pro:
+## Performance and deadlines
 
-| Tool | Backend | Latency |
-|------|---------|---------|
-| `memory_info` | Native Win32 | **<1ms** |
-| `system_info` | Native Win32 | **<1ms** |
-| `disk_info` | Native Win32 | **<1ms** |
-| `service_list` | Native Win32 | **4ms** |
-| `process_list` | Native Win32 | **9ms** |
-| `cpu_info` | PowerShell | ~1,100ms |
-| `eventlog_query` | PowerShell | ~1,250ms |
-| `firewall_rules_list` | PowerShell | ~1,500ms |
+Native calls avoid launching a shell for each operation. Latency still depends
+on the provider, target process, storage and requested result size. Old timings
+for the PowerShell implementations of firewall and event-log tools do not
+describe their current native implementations.
 
-Native tools are **100-1000x faster** than PowerShell-backed tools. The 37 native tools cover the most commonly used operations plus full computer use. The 61 PowerShell tools handle the COM/WMI-only operations that would require 10x the code to implement natively, and we will get to them eventually, probably, when the rage builds back up.
+Read timing and error output in the log. A timeout is not a rollback, and a
+successful service, VM, device, terminal or debugger request does not establish
+application completion. Inspect the returned state and use the corresponding
+wait or history tool.
 
 ## Why "MasterControlProgram"?
 
@@ -443,4 +511,5 @@ So we wrote it in Rust with direct Win32 syscalls, because we have standards and
 
 ## Contributing
 
-PRs welcome. If you migrate one of the 61 PowerShell tools to native Win32, you are a hero and we will buy you a beer. If you want to add a new tool, go for it, just put it in the right category in `server.rs` and the tool router will pick it up automatically.
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the router layout, focused test
+commands, native fixture precautions and documentation requirements.
