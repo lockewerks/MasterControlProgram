@@ -34,9 +34,8 @@
 //!
 //! ## Screenshots
 //!
-//! `screen_capture` does not light the glow, so a screenshot on its own comes
-//! back clean. A screenshot taken while the glow is still lit from a click or a
-//! keystroke will contain it.
+//! Capture does not light the glow. The capture path briefly suppresses it,
+//! waits for the compositor, then restores the existing envelope.
 //!
 //! This started out using `SetWindowDisplayAffinity(WDA_EXCLUDEFROMCAPTURE)` to
 //! keep out of captures unconditionally, and that was a mistake worth recording.
@@ -53,8 +52,8 @@
 //! exists for. `MCP_OVERLAY_AFFINITY=exclude` opts back in on hardware where it
 //! genuinely works.
 
-use std::sync::atomic::{AtomicIsize, Ordering};
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
+use std::sync::{mpsc, Mutex, MutexGuard, TryLockError};
 use std::time::{Duration, Instant};
 
 use windows::Win32::Foundation::{
@@ -114,12 +113,82 @@ const WM_PULSE: u32 = WM_APP + 1;
 /// Posted to ourselves from the window procedure when the monitor layout
 /// changes, to get the rebuild out of a broadcast message and into the loop.
 const WM_REFIT: u32 = WM_APP + 2;
+const WM_CAPTURE_BARRIER: u32 = WM_APP + 3;
+const WM_CAPTURE_CHANGED: u32 = WM_APP + 4;
 
 // ─── Public surface ──────────────────────────────────────────────────────────
 
 /// The window we post to, or 0 for "not running." Every path that gives up
 /// leaves this at 0, so `pulse()` needs no other notion of failure.
 static TARGET: AtomicIsize = AtomicIsize::new(0);
+static CAPTURE_SUPPRESSED: AtomicBool = AtomicBool::new(false);
+static CAPTURE_LOCK: Mutex<()> = Mutex::new(());
+
+pub(crate) fn is_overlay(hwnd: HWND) -> bool {
+    let target = TARGET.load(Ordering::Acquire);
+    target != 0 && target == hwnd.0 as isize
+}
+
+pub(crate) struct CaptureGuard {
+    target: isize,
+    _lock: MutexGuard<'static, ()>,
+}
+
+impl CaptureGuard {
+    pub fn suppressed(&self) -> bool {
+        self.target != 0
+    }
+}
+
+impl Drop for CaptureGuard {
+    fn drop(&mut self) {
+        CAPTURE_SUPPRESSED.store(false, Ordering::Release);
+        if self.target != 0 && TARGET.load(Ordering::Acquire) == self.target {
+            if let Err(error) = unsafe {
+                PostMessageW(
+                    Some(HWND(self.target as *mut _)),
+                    WM_CAPTURE_CHANGED,
+                    WPARAM(0),
+                    LPARAM(0),
+                )
+            } {
+                tracing::warn!(%error, "Could not notify the activity glow after capture");
+            }
+        }
+    }
+}
+
+pub(crate) fn suppress_for_capture(timeout: Duration) -> anyhow::Result<CaptureGuard> {
+    let lock = CAPTURE_LOCK
+        .lock()
+        .map_err(|_| anyhow::anyhow!("Activity glow capture synchronization was poisoned"))?;
+    let guard = CaptureGuard {
+        target: TARGET.load(Ordering::Acquire),
+        _lock: lock,
+    };
+    if guard.target == 0 {
+        return Ok(guard);
+    }
+    CAPTURE_SUPPRESSED.store(true, Ordering::Release);
+    let mut acknowledged = 0usize;
+    let delivered = unsafe {
+        SendMessageTimeoutW(
+            HWND(guard.target as *mut _),
+            WM_CAPTURE_BARRIER,
+            WPARAM(0),
+            LPARAM(0),
+            SMTO_ABORTIFHUNG | SMTO_BLOCK | SMTO_ERRORONEXIT,
+            timeout.as_millis().clamp(1, 1000) as u32,
+            Some(&mut acknowledged),
+        )
+    };
+    if delivered.0 == 0 || acknowledged != 1 {
+        anyhow::bail!("The activity glow did not acknowledge capture suppression");
+    }
+    unsafe { windows::Win32::Graphics::Dwm::DwmFlush() }
+        .map_err(|e| anyhow::anyhow!("Could not synchronize capture exclusion with the compositor: {e}"))?;
+    Ok(guard)
+}
 
 /// Start the overlay. Never fails: if anything goes wrong the glow simply does
 /// not exist for this session and every `pulse()` is a load and a branch.
@@ -494,6 +563,12 @@ fn virtual_screen() -> (i32, i32, i32, i32) {
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     unsafe {
         match msg {
+            WM_CAPTURE_BARRIER => {
+                if CAPTURE_SUPPRESSED.load(Ordering::Acquire) {
+                    let _ = ShowWindow(hwnd, SW_HIDE);
+                }
+                LRESULT(1)
+            }
             // Belt to WS_EX_TRANSPARENT's braces. The tools inject real clicks
             // with SendInput, and a window that answered a hit test would eat
             // them: a spectacular way for a status indicator to break the thing
@@ -548,6 +623,20 @@ impl Glow {
     /// second for the rest of the session.
     unsafe fn render(&mut self, alpha: u8) -> anyhow::Result<()> {
         unsafe {
+            // The capture barrier must not be followed by a render that had
+            // already sampled the old alpha. Never block the message pump.
+            let _render = match CAPTURE_LOCK.try_lock() {
+                Ok(guard) => guard,
+                Err(TryLockError::WouldBlock) => return Ok(()),
+                Err(TryLockError::Poisoned(_)) => {
+                    anyhow::bail!("Activity glow capture synchronization was poisoned")
+                }
+            };
+            let alpha = if CAPTURE_SUPPRESSED.load(Ordering::Acquire) {
+                0
+            } else {
+                alpha
+            };
             if alpha == 0 {
                 if self.visible {
                     let _ = ShowWindow(self.hwnd, SW_HIDE);
@@ -841,6 +930,10 @@ fn run(glow: &mut Glow) {
                         WM_QUIT => return,
                         WM_PULSE => envelope.trigger(Instant::now()),
                         WM_REFIT => glow.refit(),
+                        WM_CAPTURE_CHANGED => {
+                            glow.visible = IsWindowVisible(glow.hwnd).as_bool();
+                            glow.last_alpha = None;
+                        }
                         _ => {
                             let _ = TranslateMessage(&msg);
                             DispatchMessageW(&msg);
@@ -880,6 +973,28 @@ fn run(glow: &mut Glow) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn capture_barrier_prevents_a_late_render_from_showing_the_glow() {
+        let _capture = CAPTURE_LOCK.lock().unwrap();
+        let mut glow = Glow {
+            hwnd: HWND::default(),
+            peak: DEFAULT_PEAK,
+            x: 0,
+            y: 0,
+            width: 1,
+            height: 1,
+            gradient: None,
+            visible: false,
+            dark_since: None,
+            uploaded: false,
+            blend_only: true,
+            last_alpha: None,
+        };
+        unsafe { glow.render(255) }.unwrap();
+        assert!(!glow.visible);
+        assert!(glow.gradient.is_none());
+    }
 
     /// Step the envelope to `ms` after `start` and report the level, the way
     /// the render loop does.

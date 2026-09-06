@@ -1,31 +1,54 @@
-//! # MasterControlProgram - Entry Point
-//!
-//! The front door to the most aggressively performant Windows MCP server
-//! ever conceived by someone who was tired of PowerShell taking 1.5 seconds
-//! to tell them what their own CPU is called.
-//!
-//! This binary does exactly three things:
-//! 1. Sets up logging so you can watch the carnage in real time
-//! 2. Spawns a pool of PowerShell processes like some kind of shell necromancer
-//! 3. Starts the MCP server and prays to the async gods
+//! Local stdio server and explicit resident-host lifecycle.
+//! Registration and installer hooks run before elevation or server initialization.
 
+mod administration;
 mod clients;
 mod coerce;
+mod connection;
+mod context;
+mod desktop;
+mod diagnostics;
 mod elevate;
+mod execution;
+mod host;
 mod installer;
+mod observation;
 mod overlay;
+mod provider_tools;
 mod ps;
+mod runtime;
 mod server;
 mod spike;
+mod system_control;
 mod win32;
+mod workflow;
 
-use rmcp::{ServiceExt, transport::stdio};
+use rmcp::{transport::stdio, ServiceExt};
 use std::fs::OpenOptions;
-use tracing_subscriber::{self, EnvFilter, fmt, prelude::*};
+use tracing_subscriber::{self, fmt, prelude::*, EnvFilter};
 use windows::Win32::UI::HiDpi::{
-    DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, GetAwarenessFromDpiAwarenessContext,
-    GetThreadDpiAwarenessContext, SetProcessDpiAwarenessContext,
+    GetAwarenessFromDpiAwarenessContext, GetThreadDpiAwarenessContext,
+    SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
 };
+
+enum EarlyAction {
+    Registration(anyhow::Result<clients::Action>),
+    KillStale,
+    OverlayDemo,
+}
+
+fn early_action(args: &[String]) -> Option<EarlyAction> {
+    if let Some(action) = clients::Action::from_args(args) {
+        return Some(EarlyAction::Registration(action));
+    }
+    if args.iter().any(|arg| arg == installer::KILL_FLAG) {
+        return Some(EarlyAction::KillStale);
+    }
+    if args.iter().any(|arg| arg == spike::FLAG) {
+        return Some(EarlyAction::OverlayDemo);
+    }
+    None
+}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -41,22 +64,18 @@ async fn main() -> anyhow::Result<()> {
     //
     // plus the matching --unregister forms. Name both to get both.
     let args: Vec<String> = std::env::args().collect();
-    if let Some(action) = clients::Action::from_args(&args) {
-        return action.and_then(clients::Action::run);
+    if let Some(action) = early_action(&args) {
+        return match action {
+            EarlyAction::Registration(action) => action.and_then(clients::Action::run),
+            EarlyAction::KillStale => installer::kill_stale(),
+            EarlyAction::OverlayDemo => spike::run(),
+        };
     }
 
-    // Installer hook: stop every other copy so an upgrade actually takes
-    // effect. Ahead of the gate because the hook is already running elevated,
-    // and a re-exec through sudo here would just be a second process to kill.
-    if args.iter().any(|a| a == installer::KILL_FLAG) {
-        return installer::kill_stale();
-    }
-
-    // Visual proof-of-life for the activity glow, ahead of the elevation gate
-    // and the pwsh pool because it needs neither: it draws and exits. See
-    // src/spike.rs for why a human has to be the one looking.
-    if args.iter().any(|a| a == spike::FLAG) {
-        return spike::run();
+    let execution_mode = host::Mode::parse(&args)?;
+    if let host::Mode::Connect { name } = &execution_mode {
+        // A bridge uses its actual token and cannot start or elevate a host.
+        return host::stdio_bridge(name.clone()).await;
     }
 
     // Dual logging: stderr for the MCP client that spawned us, and a file for
@@ -83,15 +102,15 @@ async fn main() -> anyhow::Result<()> {
         .with_timer(fmt::time::uptime());
 
     tracing_subscriber::registry()
-        .with(
-            EnvFilter::from_default_env()
-                .add_directive(tracing::Level::INFO.into()),
-        )
+        .with(EnvFilter::from_default_env().add_directive(tracing::Level::INFO.into()))
         .with(file_layer)
         .with(stderr_layer)
         .init();
 
-    tracing::info!("MasterControlProgram v{} starting", env!("CARGO_PKG_VERSION"));
+    tracing::info!(
+        "MasterControlProgram v{} starting",
+        env!("CARGO_PKG_VERSION")
+    );
     tracing::info!("log file: {}", log_path.display());
 
     // Elevation gate. Has to clear before the PowerShell pool starts, or the
@@ -115,9 +134,8 @@ async fn main() -> anyhow::Result<()> {
     //
     // Runs before any DPI-sensitive API. Logging setup and the elevation gate
     // above touch none of them, and the wrapper process exits without drawing.
-    let dpi_set_result = unsafe {
-        SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2)
-    };
+    let dpi_set_result =
+        unsafe { SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) };
 
     // Verify DPI awareness actually took effect. Maps the awareness enum
     // value to a human-readable label so debugging coordinate issues on
@@ -134,8 +152,12 @@ async fn main() -> anyhow::Result<()> {
         }
     };
     match dpi_set_result {
-        Ok(()) => tracing::info!("DPI awareness: set PER_MONITOR_AWARE_V2, thread reports {awareness_label}"),
-        Err(e) => tracing::warn!("DPI awareness: failed to set V2 ({e}), thread reports {awareness_label}"),
+        Ok(()) => tracing::info!(
+            "DPI awareness: set PER_MONITOR_AWARE_V2, thread reports {awareness_label}"
+        ),
+        Err(e) => tracing::warn!(
+            "DPI awareness: failed to set V2 ({e}), thread reports {awareness_label}"
+        ),
     }
 
     // The activity glow. Spawns a thread owning one layered, click-through,
@@ -153,28 +175,120 @@ async fn main() -> anyhow::Result<()> {
     // at the wrong size. Setting the process default first means the overlay
     // thread inherits PER_MONITOR_AWARE_V2 too.
     //
-    // Before the pool because the pool costs the better part of a second and
-    // this is a thread spawn: overlapping them means the glow is armed before
-    // the client can land its first tool call.
+    // Arm the glow before the client can land its first tool call.
     overlay::init();
 
-    // You can override pool size with MCP_POOL_SIZE env var.
-    // Default is 3 because three PowerShell processes is already three too many,
-    // but some of our tools still need the damn thing.
-    let pool_size: usize = std::env::var("MCP_POOL_SIZE")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(3);
+    // Validate configuration without starting pwsh. Native tools and the stdio
+    // handshake must work even when PowerShell is not installed.
+    let ps_pool = ps::Pool::from_env()?;
+    let local_host = match execution_mode {
+        host::Mode::Host {
+            name,
+            state_directory,
+        } => Some(host::LocalHost::bind(name, state_directory).await?),
+        _ => None,
+    };
+    let server = if let Some(host) = &local_host {
+        let context = host.context();
+        tokio::task::spawn_blocking(move || {
+            let execution = std::sync::Arc::new(execution::ExecutionManager::new(context)?);
+            server::MasterControlProgram::new_with_execution(ps_pool, execution)
+        })
+        .await??
+    } else {
+        tokio::task::spawn_blocking(move || server::MasterControlProgram::new(ps_pool)).await??
+    };
+    server.observation.recover_native_traces().await;
+    if let Some(host) = local_host {
+        return host.run(server).await;
+    }
 
-    // Boot the PowerShell sweatshop and the MCP server
-    let ps_pool = ps::Pool::new(pool_size).await?;
-    let server = server::MasterControlProgram::new(ps_pool);
-    let service = server.serve(stdio()).await.inspect_err(|e| {
-        tracing::error!("server error: {:?}", e);
-    })?;
-
-    tracing::info!("MCP server connected, waiting for requests");
-    service.waiting().await?;
+    let disconnected = server.execution_connection_cancel.clone();
+    let transport = connection::observe(stdio(), disconnected.clone());
+    let outcome = async {
+        let service = server.clone().serve(transport).await?;
+        tracing::info!("MCP server connected, waiting for requests");
+        let cancel = service.cancellation_token();
+        let waiting = service.waiting();
+        tokio::pin!(waiting);
+        tokio::select! {
+            result = &mut waiting => result.map(|_| ()).map_err(anyhow::Error::from),
+            _ = disconnected.cancelled() => {
+                cancel.cancel();
+                let cleanup = server.shutdown_connection().await;
+                let stopped = tokio::time::timeout(std::time::Duration::from_secs(10), &mut waiting)
+                    .await.map_err(|_| anyhow::anyhow!("stdio service did not stop after disconnect"))
+                    .and_then(|result| result.map(|_| ()).map_err(anyhow::Error::from));
+                server::lifecycle_result([("connection cleanup", cleanup), ("stdio shutdown", stopped)])
+            }
+        }
+    }.await;
+    let connection_cleanup = server.shutdown_connection().await;
+    let shutdown = server.shutdown().await;
     tracing::info!("MCP server shutting down");
-    Ok(())
+    server::lifecycle_result([
+        ("stdio service", outcome),
+        ("connection cleanup", connection_cleanup),
+        ("server shutdown", shutdown),
+    ])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(flags: &[&str]) -> Vec<String> {
+        std::iter::once("MasterControlProgram")
+            .chain(flags.iter().copied())
+            .map(str::to_owned)
+            .collect()
+    }
+
+    #[test]
+    fn registration_precedes_installer_hook_and_overlay() {
+        let action = early_action(&args(&["--register", installer::KILL_FLAG, spike::FLAG]));
+        assert!(matches!(action, Some(EarlyAction::Registration(_))));
+    }
+
+    #[test]
+    fn conflicting_registration_exits_before_server_startup() {
+        let action = early_action(&args(&["--register", "--unregister", spike::FLAG]));
+        assert!(matches!(action, Some(EarlyAction::Registration(Err(_)))));
+    }
+
+    #[test]
+    fn installer_hook_precedes_overlay_demo() {
+        assert!(matches!(
+            early_action(&args(&[spike::FLAG, installer::KILL_FLAG])),
+            Some(EarlyAction::KillStale)
+        ));
+        assert!(matches!(
+            early_action(&args(&[spike::FLAG])),
+            Some(EarlyAction::OverlayDemo)
+        ));
+        assert!(early_action(&args(&[])).is_none());
+    }
+
+    #[test]
+    fn startup_order_preserves_elevation_and_early_cli_paths() {
+        let src = include_str!("main.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap();
+        let stages = [
+            "early_action(&args)",
+            "let log_path",
+            "match elevate::gate()",
+            "SetProcessDpiAwarenessContext(",
+            "overlay::init()",
+            "ps::Pool::from_env()",
+            "connection::observe(stdio()",
+            ".serve(transport)",
+        ];
+        let positions: Vec<_> = stages
+            .iter()
+            .map(|stage| src.find(stage).unwrap())
+            .collect();
+        assert!(positions.windows(2).all(|pair| pair[0] < pair[1]));
+    }
 }

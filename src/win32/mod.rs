@@ -1,13 +1,4 @@
-//! # Direct Win32 Syscall Layer
-//!
-//! This is where we bypass PowerShell's bloated ass and talk directly to the
-//! Windows kernel like adults. Sub-millisecond responses instead of waiting
-//! 1.5 seconds for PowerShell to load half of .NET just to count processes.
-//!
-//! 41 of our 98 tools run through here. The other 57 are stuck in PowerShell
-//! purgatory because Microsoft decided that firewall rules, scheduled tasks,
-//! and user management should only be accessible through COM objects.
-//! Thanks, Microsoft. Real cool.
+//! Native Windows API and COM providers shared by the MCP tools.
 
 pub mod process;
 pub mod service;
@@ -19,6 +10,18 @@ pub mod clipboard;
 pub mod screen;
 pub mod input;
 pub mod display;
+pub mod audio;
+pub mod accounts;
+pub mod eventlog;
+pub mod firewall;
+pub mod tasks;
+pub mod admin_common;
+pub mod network_admin;
+pub mod wifi_admin;
+pub mod network_proxy;
+pub mod virtualization;
+pub mod devices;
+pub mod storage;
 
 use windows::core::PWSTR;
 

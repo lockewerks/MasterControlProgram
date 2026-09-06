@@ -1,6 +1,6 @@
 [package]
 name = "master-control-program"
-version = "1.3.0"
+version = "1.4.0"
 edition = "2021"
 description = "The fastest Windows 11 system control MCP server"
 
@@ -11,6 +11,8 @@ path = "src/main.rs"
 [dependencies]
 rmcp = { version = "1", features = ["server", "transport-io"] }
 tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+windows-core = "0.62"
 serde = { version = "1", features = ["derive"] }
 # preserve_order: we rewrite the user's claude_desktop_config.json in place.
 # Without this, serde reorders every key alphabetically and the diff looks like
@@ -33,24 +35,72 @@ version = "0.62"
 features = [
     "Win32_Foundation",
     "Win32_System_Threading",
+    "Win32_System_JobObjects",
     "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_Diagnostics_Debug",
+    "Win32_System_Diagnostics_ProcessSnapshotting",
+    "Win32_System_Diagnostics_Etw",
     "Win32_System_ProcessStatus",
     "Win32_System_Services",
     "Win32_System_LibraryLoader",
     "Win32_System_Registry",
     "Win32_System_SystemInformation",
+    "Win32_System_Com",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_Ole",
+    "Win32_System_Variant",
+    "Win32_System_Time",
+    "Win32_System_TaskScheduler",
+    "Win32_System_EventLog",
+    "Win32_System_WinRT",
+    "Win32_System_RemoteDesktop",
+    "Win32_System_StationsAndDesktops",
+    "Win32_System_Console",
+    "Win32_System_Pipes",
+    "Win32_System_IO",
+    "Win32_System_Ioctl",
+    "Win32_System_SystemServices",
+    "Win32_System_WindowsProgramming",
+    "Win32_System_RestartManager",
+    "Win32_System_Kernel",
     "Win32_Storage_FileSystem",
+    "Win32_Storage_Vhd",
     "Win32_Security",
     "Win32_Security_Authorization",
+    "Win32_Security_Credentials",
+    "Win32_Security_Cryptography",
     "Win32_NetworkManagement_IpHelper",
     "Win32_NetworkManagement_Ndis",
+    "Win32_NetworkManagement_NetManagement",
+    "Win32_NetworkManagement_WindowsFirewall",
+    "Win32_NetworkManagement_WiFi",
     "Win32_Networking_WinSock",
+    "Win32_Networking_WinHttp",
+    "Win32_Networking_WinInet",
     "Win32_System_DataExchange",
     "Win32_System_Memory",
     "Win32_Graphics_Gdi",
+    "Win32_Graphics_Dwm",
+    "Win32_Globalization",
+    "Win32_Devices_FunctionDiscovery",
+    "Win32_Devices_DeviceAndDriverInstallation",
+    "Win32_Devices_Properties",
+    "Win32_Media_Audio",
+    "Win32_Media_Audio_Endpoints",
+    "Win32_Media_KernelStreaming",
+    "Win32_Media_Multimedia",
     "Win32_UI_HiDpi",
+    "Win32_UI_Accessibility",
+    "Win32_UI_Shell",
+    "Win32_UI_Shell_PropertiesSystem",
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_WindowsAndMessaging",
+    "Foundation",
+    "Foundation_Collections",
+    "Globalization",
+    "Graphics_Imaging",
+    "Media_Ocr",
+    "Storage_Streams",
 ]
 
 [profile.release]

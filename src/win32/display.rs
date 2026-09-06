@@ -17,47 +17,187 @@
 //! with mouse and screen_capture coordinates.
 
 use super::{pretty, wchar_to_string};
-use anyhow::Result;
+use anyhow::{bail, Context, Result};
+use rmcp::schemars;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
+use windows::core::{BOOL, PCWSTR};
 use windows::Win32::Foundation::{LPARAM, RECT, TRUE};
 use windows::Win32::Graphics::Gdi::*;
+use windows::Win32::UI::HiDpi::{
+    GetDpiForMonitor, SetThreadDpiAwarenessContext, DPI_AWARENESS_CONTEXT,
+    DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, MDT_EFFECTIVE_DPI,
+};
 use windows::Win32::UI::WindowsAndMessaging::*;
-use windows::core::{BOOL, PCWSTR};
 
-/// Callback for EnumDisplayMonitors. Appends each HMONITOR to the Vec
-/// passed via LPARAM. Always returns TRUE to keep the enumeration going.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub(crate) struct Rect {
+    #[serde(deserialize_with = "crate::coerce::num")]
+    pub x: i32,
+    #[serde(deserialize_with = "crate::coerce::num")]
+    pub y: i32,
+    #[serde(deserialize_with = "crate::coerce::num")]
+    pub width: u32,
+    #[serde(deserialize_with = "crate::coerce::num")]
+    pub height: u32,
+}
+
+impl Rect {
+    pub fn right(&self) -> i64 {
+        i64::from(self.x) + i64::from(self.width)
+    }
+
+    pub fn bottom(&self) -> i64 {
+        i64::from(self.y) + i64::from(self.height)
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        if self.width == 0 || self.height == 0 {
+            bail!("A rectangle must have nonzero width and height");
+        }
+        if self.width > i32::MAX as u32
+            || self.height > i32::MAX as u32
+            || self.right() > i64::from(i32::MAX)
+            || self.bottom() > i64::from(i32::MAX)
+        {
+            bail!("Rectangle coordinates exceed the Win32 coordinate range");
+        }
+        Ok(())
+    }
+
+    pub fn intersect(&self, other: &Self) -> Option<Self> {
+        let x = i64::from(self.x.max(other.x));
+        let y = i64::from(self.y.max(other.y));
+        let right = self.right().min(other.right());
+        let bottom = self.bottom().min(other.bottom());
+        (right > x && bottom > y).then_some(Self {
+            x: x as i32,
+            y: y as i32,
+            width: (right - x).max(0) as u32,
+            height: (bottom - y).max(0) as u32,
+        })
+    }
+
+    pub fn from_native(rect: RECT) -> Result<Self> {
+        let width = i64::from(rect.right) - i64::from(rect.left);
+        let height = i64::from(rect.bottom) - i64::from(rect.top);
+        let rect = Self {
+            x: rect.left,
+            y: rect.top,
+            width: u32::try_from(width).context("Invalid native rectangle width")?,
+            height: u32::try_from(height).context("Invalid native rectangle height")?,
+        };
+        rect.validate()?;
+        Ok(rect)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub(crate) struct Monitor {
+    pub index: u32,
+    pub device: String,
+    pub primary: bool,
+    pub bounds: Rect,
+    pub work_area: Rect,
+    pub orientation: String,
+    pub orientation_degrees: u32,
+    pub refresh_hz: u32,
+    pub bits_per_pixel: u32,
+    pub pels_width: u32,
+    pub pels_height: u32,
+    pub dpi_x: Option<u32>,
+    pub dpi_y: Option<u32>,
+    pub scale_x: Option<f64>,
+    pub scale_y: Option<f64>,
+    pub limitations: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub(crate) struct Geometry {
+    pub virtual_screen: Rect,
+    pub monitors: Vec<Monitor>,
+}
+
+// Blocking-pool threads can inherit a caller's DPI context. Restore that
+// context when the native operation ends rather than changing the whole pool.
+pub(crate) struct DpiScope(DPI_AWARENESS_CONTEXT);
+
+impl DpiScope {
+    pub fn enter() -> Result<Self> {
+        let old =
+            unsafe { SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) };
+        if old.0.is_null() {
+            bail!(
+                "SetThreadDpiAwarenessContext failed: {}",
+                windows::core::Error::from_thread()
+            );
+        }
+        Ok(Self(old))
+    }
+}
+
+impl Drop for DpiScope {
+    fn drop(&mut self) {
+        unsafe {
+            if SetThreadDpiAwarenessContext(self.0).0.is_null() {
+                tracing::warn!("Could not restore the thread DPI context");
+            }
+        }
+    }
+}
+
+#[derive(Default)]
+struct MonitorHandles {
+    handles: Vec<HMONITOR>,
+    overflow: bool,
+}
+
 unsafe extern "system" fn enum_proc(
     hmon: HMONITOR,
     _hdc: HDC,
     _rect: *mut RECT,
     lparam: LPARAM,
 ) -> BOOL {
-    let monitors = unsafe { &mut *(lparam.0 as *mut Vec<HMONITOR>) };
-    monitors.push(hmon);
+    let monitors = unsafe { &mut *(lparam.0 as *mut MonitorHandles) };
+    if monitors.handles.len() >= 256 {
+        monitors.overflow = true;
+        return BOOL(0);
+    }
+    monitors.handles.push(hmon);
     TRUE
 }
 
-pub fn info() -> Result<String> {
+pub(crate) fn geometry() -> Result<Geometry> {
+    let _dpi = DpiScope::enter()?;
     unsafe {
-        let mut handles: Vec<HMONITOR> = Vec::new();
+        let mut handles = MonitorHandles::default();
         let ok = EnumDisplayMonitors(
             None,
             None,
             Some(enum_proc),
             LPARAM(&mut handles as *mut _ as isize),
         );
+        if handles.overflow {
+            bail!("Monitor enumeration exceeded the 256-monitor limit");
+        }
         if !ok.as_bool() {
-            anyhow::bail!("EnumDisplayMonitors failed");
+            bail!(
+                "EnumDisplayMonitors failed: {}",
+                windows::core::Error::from_thread()
+            );
         }
 
-        let mut monitors = Vec::with_capacity(handles.len());
-        for (i, hmon) in handles.iter().enumerate() {
+        let mut monitors = Vec::with_capacity(handles.handles.len());
+        for (i, hmon) in handles.handles.iter().enumerate() {
             let mut info_ex: MONITORINFOEXW = std::mem::zeroed();
             info_ex.monitorInfo.cbSize = std::mem::size_of::<MONITORINFOEXW>() as u32;
 
             let got = GetMonitorInfoW(*hmon, &mut info_ex.monitorInfo as *mut MONITORINFO);
             if !got.as_bool() {
-                continue;
+                bail!(
+                    "GetMonitorInfoW failed for monitor {i}: {}",
+                    windows::core::Error::from_thread()
+                );
             }
 
             let rc = info_ex.monitorInfo.rcMonitor;
@@ -65,9 +205,6 @@ pub fn info() -> Result<String> {
             let is_primary = info_ex.monitorInfo.dwFlags & MONITORINFOF_PRIMARY != 0;
             let device_name = wchar_to_string(&info_ex.szDevice);
 
-            // DEVMODE pulls refresh rate, bit depth, and most importantly
-            // dmDisplayOrientation so we can distinguish landscape vs portrait
-            // vs flipped instead of pretending rotated monitors don't exist.
             let mut devmode: DEVMODEW = std::mem::zeroed();
             devmode.dmSize = std::mem::size_of::<DEVMODEW>() as u16;
             let device_ptr = PCWSTR(info_ex.szDevice.as_ptr());
@@ -75,65 +212,197 @@ pub fn info() -> Result<String> {
                 EnumDisplaySettingsW(device_ptr, ENUM_CURRENT_SETTINGS, &mut devmode).as_bool();
 
             let (orientation, orientation_degrees) = if have_devmode {
-                // The orientation field lives inside a nested anonymous union.
-                // Windows-RS exposes it as Anonymous1.Anonymous2.dmDisplayOrientation.
-                // Values: 0=DMDO_DEFAULT, 1=DMDO_90, 2=DMDO_180, 3=DMDO_270.
                 let orient = devmode.Anonymous1.Anonymous2.dmDisplayOrientation;
                 match orient {
                     DMDO_DEFAULT => ("Landscape", 0u32),
-                    DMDO_90 => ("Portrait (rotated 90° CCW)", 90),
-                    DMDO_180 => ("Landscape (flipped 180°)", 180),
-                    DMDO_270 => ("Portrait (rotated 270° CCW)", 270),
+                    DMDO_90 => ("Portrait (rotated 90\u{b0} CCW)", 90),
+                    DMDO_180 => ("Landscape (flipped 180\u{b0})", 180),
+                    DMDO_270 => ("Portrait (rotated 270\u{b0} CCW)", 270),
                     _ => ("Unknown", 0),
                 }
             } else {
                 ("Unknown (DEVMODE unavailable)", 0)
             };
 
-            monitors.push(json!({
-                "Index": i,
-                "Device": device_name,
-                "Primary": is_primary,
-                "Bounds": {
-                    "Left": rc.left,
-                    "Top": rc.top,
-                    "Right": rc.right,
-                    "Bottom": rc.bottom,
-                    "Width": rc.right - rc.left,
-                    "Height": rc.bottom - rc.top,
+            let mut limitations = Vec::new();
+            if !have_devmode {
+                limitations.push("Current display settings are unavailable".into());
+            }
+            let (mut dpi_x, mut dpi_y) = (0, 0);
+            let dpi = match GetDpiForMonitor(*hmon, MDT_EFFECTIVE_DPI, &mut dpi_x, &mut dpi_y) {
+                Ok(()) if dpi_x > 0 && dpi_y > 0 => Some((dpi_x, dpi_y)),
+                Ok(()) => {
+                    limitations.push("Monitor DPI was reported as zero".into());
+                    None
+                }
+                Err(e) => {
+                    limitations.push(format!("Monitor DPI unavailable: {e}"));
+                    None
+                }
+            };
+            monitors.push(Monitor {
+                index: i as u32,
+                device: device_name,
+                primary: is_primary,
+                bounds: Rect::from_native(rc)?,
+                work_area: Rect::from_native(work)?,
+                orientation: orientation.into(),
+                orientation_degrees,
+                refresh_hz: if have_devmode {
+                    devmode.dmDisplayFrequency
+                } else {
+                    0
                 },
-                "WorkArea": {
-                    "Left": work.left,
-                    "Top": work.top,
-                    "Right": work.right,
-                    "Bottom": work.bottom,
-                    "Width": work.right - work.left,
-                    "Height": work.bottom - work.top,
+                bits_per_pixel: if have_devmode {
+                    devmode.dmBitsPerPel
+                } else {
+                    0
                 },
-                "Orientation": orientation,
-                "OrientationDegrees": orientation_degrees,
-                "RefreshHz": if have_devmode { devmode.dmDisplayFrequency } else { 0 },
-                "BitsPerPixel": if have_devmode { devmode.dmBitsPerPel } else { 0 },
-                "PelsWidth": if have_devmode { devmode.dmPelsWidth } else { 0 },
-                "PelsHeight": if have_devmode { devmode.dmPelsHeight } else { 0 },
-            }));
+                pels_width: if have_devmode { devmode.dmPelsWidth } else { 0 },
+                pels_height: if have_devmode {
+                    devmode.dmPelsHeight
+                } else {
+                    0
+                },
+                dpi_x: dpi.map(|d| d.0),
+                dpi_y: dpi.map(|d| d.1),
+                scale_x: dpi.map(|d| f64::from(d.0) / 96.0),
+                scale_y: dpi.map(|d| f64::from(d.1) / 96.0),
+                limitations,
+            });
         }
 
-        let vx = GetSystemMetrics(SM_XVIRTUALSCREEN);
-        let vy = GetSystemMetrics(SM_YVIRTUALSCREEN);
         let vw = GetSystemMetrics(SM_CXVIRTUALSCREEN);
         let vh = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+        if vw <= 0 || vh <= 0 || monitors.is_empty() {
+            bail!("No accessible interactive desktop monitors are available");
+        }
+        let virtual_screen = Rect {
+            x: GetSystemMetrics(SM_XVIRTUALSCREEN),
+            y: GetSystemMetrics(SM_YVIRTUALSCREEN),
+            width: vw as u32,
+            height: vh as u32,
+        };
+        virtual_screen.validate()?;
+        Ok(Geometry {
+            virtual_screen,
+            monitors,
+        })
+    }
+}
 
-        Ok(pretty(&json!({
-            "MonitorCount": monitors.len(),
-            "Monitors": monitors,
-            "VirtualScreen": {
-                "OriginX": vx,
-                "OriginY": vy,
-                "Width": vw,
-                "Height": vh,
-                "Note": "Mouse and screen_capture coordinates live in this space. A monitor with negative Left/Top is left of / above the primary.",
-            },
-        })))
+pub fn info() -> Result<String> {
+    let geometry = geometry()?;
+    fn legacy_rect(rect: Rect) -> serde_json::Value {
+        json!({
+            "Left": rect.x, "Top": rect.y, "Right": rect.right(), "Bottom": rect.bottom(),
+            "Width": rect.width, "Height": rect.height,
+        })
+    }
+    let monitors: Vec<_> = geometry
+        .monitors
+        .iter()
+        .map(|m| {
+            json!({
+                "Index": m.index, "Device": m.device, "Primary": m.primary,
+                "Bounds": legacy_rect(m.bounds), "WorkArea": legacy_rect(m.work_area),
+                "Orientation": m.orientation, "OrientationDegrees": m.orientation_degrees,
+                "RefreshHz": m.refresh_hz, "BitsPerPixel": m.bits_per_pixel,
+                "PelsWidth": m.pels_width, "PelsHeight": m.pels_height,
+                "DpiX": m.dpi_x, "DpiY": m.dpi_y, "ScaleX": m.scale_x, "ScaleY": m.scale_y,
+                "Limitations": m.limitations,
+            })
+        })
+        .collect();
+    Ok(pretty(&json!({
+        "MonitorCount": monitors.len(), "Monitors": monitors,
+        "VirtualScreen": {
+            "OriginX": geometry.virtual_screen.x, "OriginY": geometry.virtual_screen.y,
+            "Width": geometry.virtual_screen.width, "Height": geometry.virtual_screen.height,
+            "Note": "Mouse and screen_capture coordinates live in this space. A monitor with negative Left/Top is left of / above the primary.",
+        },
+    })))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn negative_coordinates_intersect_without_unsigned_wrap() {
+        let desktop = Rect {
+            x: -1920,
+            y: -1080,
+            width: 3840,
+            height: 2160,
+        };
+        let area = Rect {
+            x: -2000,
+            y: -100,
+            width: 200,
+            height: 200,
+        };
+        assert_eq!(
+            desktop.intersect(&area),
+            Some(Rect {
+                x: -1920,
+                y: -100,
+                width: 120,
+                height: 200
+            })
+        );
+        assert_eq!(
+            desktop.intersect(&Rect {
+                x: 1920,
+                y: 0,
+                width: 1,
+                height: 1
+            }),
+            None
+        );
+    }
+
+    #[test]
+    fn rectangles_reject_zero_and_coordinate_overflow() {
+        assert!(Rect {
+            x: 0,
+            y: 0,
+            width: 0,
+            height: 1
+        }
+        .validate()
+        .is_err());
+        assert!(Rect {
+            x: i32::MAX,
+            y: 0,
+            width: 1,
+            height: 1
+        }
+        .validate()
+        .is_err());
+        assert!(Rect {
+            x: i32::MIN,
+            y: 0,
+            width: u32::MAX,
+            height: 1
+        }
+        .validate()
+        .is_err());
+    }
+
+    #[test]
+    fn rectangles_accept_numeric_strings() {
+        let rect: Rect =
+            serde_json::from_str(r#"{"x":"-1920","y":"-100","width":"800","height":"600"}"#)
+                .unwrap();
+        assert_eq!(
+            rect,
+            Rect {
+                x: -1920,
+                y: -100,
+                width: 800,
+                height: 600
+            }
+        );
     }
 }

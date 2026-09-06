@@ -6,9 +6,9 @@
 
 [product]
 name         = "MasterControlProgram"
-version      = "1.3.0"
+version      = "1.4.0"
 publisher    = "Locke Werks"
-description  = "Windows 11 system control over MCP. 98 tools, 37 direct Win32 syscalls, full computer use."
+description  = "Local Windows system and desktop control over MCP."
 copyright    = "Copyright (c) 2026 Locke Werks"
 url          = "https://github.com/lockewerks/MasterControlProgram"
 # Same file the README header and the exe resource use.
