@@ -6,7 +6,7 @@
 
 [product]
 name         = "MasterControlProgram"
-version      = "1.4.0"
+version      = "1.5.0"
 publisher    = "Locke Werks"
 description  = "Local Windows system and desktop control over MCP."
 copyright    = "Copyright (c) 2026 Locke Werks"
