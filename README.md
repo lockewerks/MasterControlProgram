@@ -16,7 +16,7 @@
 
 > *"End of line."*
 
-**202 tools in v1.6.0.** Native Windows administration, desktop observation and
+**202 tools in v1.6.1.** Native Windows administration, desktop observation and
 input, addressable terminals and jobs, event recording, deterministic workflows,
 and process diagnostics with guarded debugger editing and binary analysis.
 
