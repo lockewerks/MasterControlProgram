@@ -798,6 +798,7 @@ mod tests {
 
     #[test]
     fn unsupported_targets_fail_without_claiming_offscreen_content() {
+        let _desktop = crate::desktop::desktop_test_lock();
         use crate::desktop::windows::{Fixture, WindowCatalog};
         let fixture = Fixture::start();
         let window = WindowCatalog::new().record_for_hwnd(fixture.hwnd).unwrap();
@@ -839,6 +840,7 @@ mod tests {
 
     #[test]
     fn native_gdi_failures_release_owned_objects_without_capturing_the_desktop() {
+        let _desktop = crate::desktop::desktop_test_lock();
         use windows::Win32::System::Threading::{
             GetCurrentProcess, GetGuiResources, GR_GDIOBJECTS,
         };

@@ -18,6 +18,25 @@ mod router;
 pub(crate) mod uia;
 pub(crate) mod windows;
 
+/// Serializes tests that drive real desktop state.
+///
+/// There is one desktop, one foreground window and one UI Automation client
+/// library per process, and cargo runs tests in parallel threads inside that
+/// one process. Several tests building UI Automation providers at once makes
+/// CoCreateInstance return E_FAIL, and window fixtures fight over which window
+/// is in front. Both show up as an assertion about something else entirely, on
+/// a different test each run, which is the most expensive kind of failure to
+/// read. Any test that builds a provider or a window fixture takes this first.
+///
+/// A poisoned lock is recovered rather than propagated: one panicking test
+/// should fail alone, not convert every other desktop test into a panic on
+/// acquisition and bury the original.
+#[cfg(test)]
+pub(crate) fn desktop_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: Mutex<()> = Mutex::new(());
+    LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 use self::windows::{
     WindowActionResult, WindowCatalog, WindowListInput, WindowListResult, WindowManageInput,
     WindowQuery, WindowRecord,

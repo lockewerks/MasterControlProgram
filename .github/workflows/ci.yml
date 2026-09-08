@@ -45,3 +45,15 @@ jobs:
         run: |
           cargo clippy --release --all-targets -- -D warnings
           if ($LASTEXITCODE -ne 0) { throw "clippy failed" }
+
+      # Four tests sat broken because nothing here ran them. The runner has an
+      # interactive-enough session for the desktop and UI Automation tests; the
+      # ones needing a disposable fixture process stay behind --ignored and are
+      # run deliberately, not here.
+      - name: Test
+        shell: pwsh
+        run: |
+          cargo test --bin MasterControlProgram
+          if ($LASTEXITCODE -ne 0) { throw "unit tests failed" }
+          cargo test --test mcp
+          if ($LASTEXITCODE -ne 0) { throw "integration tests failed" }

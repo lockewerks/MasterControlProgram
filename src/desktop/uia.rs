@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
-    mpsc, Arc, OnceLock,
+    mpsc, Arc, Mutex, OnceLock,
 };
 use std::time::{Duration, Instant};
 use windows::core::{Interface, BSTR, HRESULT};
@@ -355,12 +355,46 @@ pub(crate) struct UiActionResult {
     pub observation_error: Option<String>,
 }
 
-type Work = Box<dyn FnOnce(&mut std::result::Result<Worker, String>) + Send>;
+type Work = Box<dyn FnOnce(&mut Option<Worker>) + Send>;
+
+/// Initializes the slot if it is empty, and hands back what is in it.
+///
+/// The point is that a failure leaves the slot empty, so the next call tries
+/// again. Caching the error instead turns one transient `CoCreateInstance`
+/// failure into a permanently dead feature: the worker is built once, lazily,
+/// and every UI Automation tool in the process goes through it. E_FAIL out of
+/// CUIAutomation8 is a real transient, it happens under desktop and session
+/// transitions and before an interactive desktop exists, and a server that
+/// answers "UI Automation unavailable" until it is restarted because of one
+/// unlucky moment at startup is worse than one that tries again.
+fn ensure<T>(slot: &mut Option<T>, new: impl FnOnce() -> Result<T>) -> Result<&mut T> {
+    if slot.is_none() {
+        *slot = Some(new()?);
+    }
+    Ok(slot.as_mut().expect("slot filled directly above"))
+}
 
 #[derive(Default)]
 pub(crate) struct UiAutomation {
     sender: OnceLock<std::result::Result<mpsc::SyncSender<Work>, String>>,
     active: Arc<AtomicBool>,
+    worker: Mutex<Option<std::thread::JoinHandle<()>>>,
+}
+
+impl Drop for UiAutomation {
+    /// Closes the channel and waits for the provider thread to finish.
+    ///
+    /// The thread owns a COM apartment. Left detached, it uninitializes
+    /// whenever it next gets scheduled, and a CoUninitialize racing the next
+    /// provider's CoCreateInstance makes that call return E_FAIL rather than
+    /// wait. In the server this runs once at shutdown and costs nothing; it is
+    /// what makes the teardown ordered instead of merely likely.
+    fn drop(&mut self) {
+        drop(self.sender.take());
+        if let Some(worker) = self.worker.get_mut().ok().and_then(Option::take) {
+            let _ = worker.join();
+        }
+    }
 }
 
 struct Active(Arc<AtomicBool>);
@@ -385,15 +419,20 @@ impl UiAutomation {
             .sender
             .get_or_init(|| {
                 let (sender, receiver) = mpsc::sync_channel::<Work>(1);
-                std::thread::Builder::new()
+                let handle = std::thread::Builder::new()
                     .name("desktop-uia".into())
                     .spawn(move || {
-                        let mut worker = Worker::new().map_err(|error| format!("{error:#}"));
+                        // Starts empty and is filled on first use. A work item
+                        // that cannot build it leaves it empty for the next.
+                        let mut worker: Option<Worker> = None;
                         for work in receiver {
                             work(&mut worker);
                         }
                     })
                     .map_err(|error| error.to_string())?;
+                if let Ok(mut slot) = self.worker.lock() {
+                    *slot = Some(handle);
+                }
                 Ok(sender)
             })
             .as_ref()
@@ -402,9 +441,11 @@ impl UiAutomation {
         let operation = operation.clone();
         sender
             .try_send(Box::new(move |worker| {
-                let result = match worker {
+                let result = match ensure(worker, Worker::new) {
                     Ok(worker) => operation.check().and_then(|_| work(worker, &operation)),
-                    Err(error) => Err(anyhow::anyhow!("UI Automation unavailable: {error}")),
+                    Err(error) => {
+                        Err(error.context("UI Automation unavailable; the next call retries"))
+                    }
                 };
                 drop(active);
                 if reply.send(result).is_err() {
@@ -516,19 +557,34 @@ impl Worker {
         let timed: IUIAutomation2 = automation.cast().context(
             "This UI Automation client has no provider timeout support (IUIAutomation2)",
         )?;
+        // Each step is named. A bare `?` here reports only "Unspecified error
+        // (0x80004005)", which says nothing about which of eight COM calls
+        // failed, and the whole provider is behind this one function.
         unsafe {
-            timed.SetConnectionTimeout(PROVIDER_TIMEOUT_MS)?;
-            timed.SetTransactionTimeout(PROVIDER_TIMEOUT_MS)?;
+            timed
+                .SetConnectionTimeout(PROVIDER_TIMEOUT_MS)
+                .context("UI Automation rejected the provider connection timeout")?;
+            timed
+                .SetTransactionTimeout(PROVIDER_TIMEOUT_MS)
+                .context("UI Automation rejected the provider transaction timeout")?;
         }
-        let walker = unsafe { automation.RawViewWalker() }?;
-        let cache = unsafe { automation.CreateCacheRequest() }?;
+        let walker = unsafe { automation.RawViewWalker() }
+            .context("UI Automation supplied no raw view tree walker")?;
+        let cache = unsafe { automation.CreateCacheRequest() }
+            .context("UI Automation could not create a cache request")?;
         unsafe {
-            cache.SetTreeScope(TreeScope_Element)?;
+            cache
+                .SetTreeScope(TreeScope_Element)
+                .context("UI Automation rejected the element cache scope")?;
             for property in PROPERTIES {
-                cache.AddProperty(*property)?;
+                cache
+                    .AddProperty(*property)
+                    .with_context(|| format!("UI Automation rejected cached property {property:?}"))?;
             }
             for (_, property) in PATTERNS {
-                cache.AddProperty(*property)?;
+                cache.AddProperty(*property).with_context(|| {
+                    format!("UI Automation rejected cached pattern property {property:?}")
+                })?;
             }
         }
         Ok(Self {
@@ -1790,6 +1846,58 @@ mod tests {
         }
     }
 
+    /// Holds one UI Automation apartment open for the whole test binary.
+    ///
+    /// The server builds exactly one UiAutomation and keeps it for the life of
+    /// the process, so its COM apartment is entered once and never left. Tests
+    /// that each build and drop their own reproduce something production never
+    /// does: the last MTA thread uninitializing takes UIAutomationCore's
+    /// process-wide state with it, and a client built against the next
+    /// apartment then fails inside `RawViewWalker` with a bare E_FAIL. Pinning
+    /// one apartment open for the run makes the short-lived ones harmless,
+    /// which is the arrangement the server already has.
+    ///
+    /// Callers must hold [`crate::desktop::desktop_test_lock`] first: this
+    /// pins the apartment, it does not serialize the provider.
+    fn pinned_automation() -> &'static UiAutomation {
+        static SHARED: OnceLock<UiAutomation> = OnceLock::new();
+        let shared = SHARED.get_or_init(UiAutomation::default);
+        // Force the worker and its apartment into existence now, rather than
+        // on whichever test happens to call first.
+        let _ = shared.run(&Operation::new(5000).unwrap(), |_, _| Ok(()));
+        shared
+    }
+
+    /// A failed provider build must not be remembered. This is the difference
+    /// between one bad moment at startup and UI Automation being dead until the
+    /// server is restarted, and it cannot be tested through Worker::new itself
+    /// because CoCreateInstance cannot be told to fail.
+    #[test]
+    fn a_failed_provider_build_is_retried_and_a_successful_one_is_kept() {
+        let attempts = std::cell::Cell::new(0);
+        let build = || {
+            attempts.set(attempts.get() + 1);
+            if attempts.get() < 3 {
+                anyhow::bail!("provider unavailable");
+            }
+            Ok(attempts.get())
+        };
+
+        let mut slot: Option<i32> = None;
+        assert!(ensure(&mut slot, build).is_err());
+        assert!(slot.is_none(), "a failed build must not fill the slot");
+        assert!(ensure(&mut slot, build).is_err());
+        assert_eq!(attempts.get(), 2, "the second call must try again");
+
+        assert_eq!(*ensure(&mut slot, build).unwrap(), 3);
+        assert_eq!(
+            *ensure(&mut slot, build).unwrap(),
+            3,
+            "a built provider must be reused, not rebuilt"
+        );
+        assert_eq!(attempts.get(), 3, "success must stop the retries");
+    }
+
     #[test]
     fn a_busy_provider_does_not_start_another_worker() {
         let automation = UiAutomation::default();
@@ -1801,6 +1909,10 @@ mod tests {
 
     #[test]
     fn cancellation_does_not_release_the_worker_until_its_call_returns() {
+        let _desktop = crate::desktop::desktop_test_lock();
+        // Pin the process apartment before building a short-lived provider,
+        // so dropping this one cannot tear UI Automation down for the run.
+        let _pinned = pinned_automation();
         let automation = Arc::new(UiAutomation::default());
         let operation = Operation::new(5000).unwrap();
         let (started, started_rx) = mpsc::sync_channel(1);
@@ -1830,7 +1942,8 @@ mod tests {
 
     #[test]
     fn an_unknown_element_reference_fails_without_issuing_input() {
-        let automation = UiAutomation::default();
+        let _desktop = crate::desktop::desktop_test_lock();
+        let automation = pinned_automation();
         let windows = Arc::new(WindowCatalog::new());
         let input: UiInvokeInput =
             serde_json::from_str(r#"{"element_ref":"stale-reference"}"#).unwrap();
@@ -1840,10 +1953,11 @@ mod tests {
 
     #[test]
     fn owned_transparent_controls_support_complete_traversal_value_and_stale_rejection() {
+        let _desktop = crate::desktop::desktop_test_lock();
         let windows = Arc::new(WindowCatalog::new());
         let fixture = super::super::windows::Fixture::accessible();
         let window = windows.record_for_hwnd(fixture.hwnd).unwrap();
-        let automation = UiAutomation::default();
+        let automation = pinned_automation();
         let tree = automation
             .find(
                 windows.clone(),

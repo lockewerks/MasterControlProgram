@@ -3454,11 +3454,39 @@ mod tests {
         .is_err());
     }
 
+    /// Whether TxF will actually open this file inside a transaction.
+    ///
+    /// Transactional NTFS is deprecated and a volume can carry no resource
+    /// manager at all, which `fsutil resource info` reports as a missing file
+    /// and a transacted open reports as ERROR_TRANSACTIONAL_OPEN_NOT_ALLOWED.
+    /// The tool handles that correctly, by refusing with a message naming the
+    /// requirement, so a machine without TxF says nothing about whether the
+    /// transactional path works and the test has nothing to assert.
+    fn transactions_supported(path: &str) -> bool {
+        let budget = Budget::new(Some(5000)).expect("probe budget");
+        let Ok(transaction) = Transaction::new(&budget) else {
+            return false;
+        };
+        let Ok(pinned) = PinnedPath::new(path, &budget) else {
+            return false;
+        };
+        pinned
+            .open(GENERIC_READ.0, Some(transaction.handle))
+            .is_ok()
+    }
+
     #[test]
     fn explicit_transaction_preserves_identity_and_commits_contents() {
         let fixture = Fixture::new();
         let path = fixture.path("transaction");
         write(create_input(&path, "one one", FileEncoding::Utf8)).unwrap();
+        if !transactions_supported(&path) {
+            eprintln!(
+                "skipping: {path} is on a volume with no TxF resource manager, \
+                 so explicit transactions cannot be exercised here"
+            );
+            return;
+        }
         let original = read_value(&path, FileEncoding::Utf8);
         let mut input = patch_input(&path, original["revision"].as_str().unwrap());
         input.consistency = FileConsistency::Transactional;

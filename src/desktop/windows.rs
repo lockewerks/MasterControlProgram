@@ -2171,6 +2171,7 @@ mod tests {
 
     #[test]
     fn owned_hidden_windows_support_query_move_resize_close_and_stale_detection() {
+        let _desktop = crate::desktop::desktop_test_lock();
         let fixture = super::Fixture::start();
         let catalog = WindowCatalog::new();
         let first = catalog.record_for_hwnd(fixture.hwnd).unwrap();
@@ -2214,7 +2215,22 @@ mod tests {
             )
             .unwrap();
         assert_eq!(found.windows.len(), 2, "{found:?}");
-        assert!(found.issues.is_empty(), "{found:?}");
+        // Enumeration walks every top-level window on the desktop, so any
+        // unrelated program closing mid-walk lands in `issues`. That says
+        // nothing about this fixture, and asserting the whole desktop held
+        // still makes the test fail for whatever happened to exit. Only issues
+        // naming the fixture's own windows mean anything here.
+        let owned: Vec<_> = fixture
+            .handles
+            .iter()
+            .map(|hwnd| format!("0x{hwnd:x}"))
+            .collect();
+        let mine: Vec<_> = found
+            .issues
+            .iter()
+            .filter(|issue| owned.iter().any(|hwnd| issue.contains(hwnd)))
+            .collect();
+        assert!(mine.is_empty(), "{mine:?} in {found:?}");
         let ambiguous = WindowManageInput {
             window_ref: None,
             query: Some(query),
