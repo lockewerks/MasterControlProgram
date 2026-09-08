@@ -23,7 +23,7 @@ env:
   # and the stub never reads it, so the per-user registration hooks would run
   # elevated and write into the administrator's profile. That is the exact
   # outcome the key exists to prevent, arriving via the version pin.
-  FORGE_VERSION: v0.3.0
+  FORGE_VERSION: v0.4.0
 
 jobs:
   release:

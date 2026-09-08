@@ -98,10 +98,12 @@ quiet_uninstall = true
 # fixed key, so installing twice replaces it rather than adding a second copy,
 # and re-running against an unchanged install rewrites identical bytes.
 #
-# Bare --register takes whichever of them are on the box, which is the only
-# form available here. Forge has no options page and hook args are fixed at
-# build time, so there is no checkbox to read: the binary decides at run time,
-# and prints what it skipped along with the flag to add it by hand later.
+# Bare --register takes whichever of them are on the box. Forge does have an
+# options page, but a checkbox per client is the wrong shape: which clients are
+# installed is a fact about the machine, not a decision for the person running
+# setup, and a hook's args are fixed at build time so it could not read the
+# answer anyway. The binary decides at run time and prints what it skipped along
+# with the flag to add it by hand later.
 #
 # The subcommand lives in the server binary rather than a helper script because
 # hooks run a payload member as argv with no shell, and because "auto" pins the
