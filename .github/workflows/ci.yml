@@ -52,7 +52,14 @@ jobs:
       # run deliberately, not here.
       - name: Test
         shell: pwsh
+        env:
+          # A panic here is read from the log by someone who cannot reproduce
+          # the runner, so an unwrapped Windows HRESULT with no frames above it
+          # is not enough to act on.
+          RUST_BACKTRACE: "1"
         run: |
+          Write-Host "TEMP=$env:TEMP"
+          Write-Host "resolved: $([System.IO.Path]::GetTempPath())"
           cargo test --bin MasterControlProgram
           if ($LASTEXITCODE -ne 0) { throw "unit tests failed" }
           cargo test --test mcp
