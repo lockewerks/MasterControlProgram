@@ -1,9 +1,10 @@
 # Windows control guide
 
-This guide covers the features added in v1.4.0 and the debugger editing tools
-added in v1.5.0. The [README tool catalog](../README.md#tool-catalog) lists all
-199 tools. MCP `tools/list` is the authority for input schemas, action enums
-and per-operation bounds.
+This guide covers the features added in v1.4.0, the debugger editing tools added
+in v1.5.0, and the binary analysis tools added in v1.6.0. The
+[README tool catalog](../README.md#tool-catalog) lists all 202 tools. MCP
+`tools/list` is the authority for input schemas, action enums and per-operation
+bounds.
 
 ## Lifetimes and result semantics
 
@@ -239,8 +240,8 @@ Use `debug_list` and `debug_inspect` to find the session and its current stop.
 `debug_break` requests a stop; wait until inspection actually reports stopped.
 `debug_continue` requires the exact current `stop_id`.
 
-`debug_command` remains read-only: `threads`, `modules`, `registers` and
-`read_memory`. `debug_evaluate` accepts an unsigned literal or `@register`,
+`debug_command` remains read-only: `threads`, `modules`, `registers`,
+`read_memory` and `disassemble`. `debug_evaluate` accepts an unsigned literal or `@register`,
 optionally followed by checked `+` or `-` of a constant. It does not run scripts,
 call target functions or interpret arbitrary DbgEng commands.
 
@@ -332,3 +333,64 @@ appear successful; cleanup failures are reported.
 Detach does not kill either attached or launched targets. `debug_terminate`
 is explicit and limited to a process launched by that debugger session.
 Debugger state never survives host exit or reboot.
+
+## Binary analysis
+
+Three tools for working on a program without its source: one live, two static.
+`binary_inspect` and `binary_disassemble` never load or run the file.
+
+`debug_command` with `command: "disassemble"` decodes from a stopped target at
+`address`, defaulting to 32 instructions and capped at 256. It decodes at the
+target's own architecture, and refuses rather than guessing on anything that is
+not x86 or x64. Where the address falls inside a mapped image the result carries
+`module`, `module_base` and `rva`, resolved through the region's allocation base
+rather than by picking the nearest module below the address.
+
+Addresses carrying this session's own breakpoints disassemble as the original
+instruction, not as the `int3` physically in memory, and `breakpoints_masked`
+lists every address that was restored for the decode. Use `debug_evaluate` to
+turn `@rip` into the numeric address first.
+
+`binary_inspect` reads a PE image's headers: machine, bitness, image base, entry
+point and its section, subsystem, and per-section addresses, sizes and
+characteristics. `include_symbols` adds the import and export tables, which is
+off by default because a system DLL carries thousands of entries. Forwarded
+exports report `forwarded_to` and no address, since they have none.
+
+`binary_disassemble` decodes from a PE on disk. `addressing` selects how
+`address` is read: `va` (default, including the image base), `rva`, or `file`
+for a byte offset into the file. Omit `address` to start at the entry point.
+Decoding happens at the virtual address, so branch targets match what a debugger
+reports for the same code. `section` and `section_executable` say where the
+address landed; bytes always decode as something, and a false
+`section_executable` is the only available warning that the result is data.
+
+An RVA inside a section's zero-filled tail has no bytes in the file and is
+refused rather than served from whatever follows on disk.
+
+### Patch encoding
+
+`binary_encode` returns the bytes for a patch and writes nothing. It takes the
+`address` the patch will be written at, an `architecture`, and a `kind`: `nop`
+with a `length`, `ret` with optional `pop_bytes`, `int3`, or `jump`/`call` with
+a `target`. The result carries `bytes_base64` for `debug_memory_write`, plus
+`bytes_hex` and the `text` those bytes disassemble back to.
+
+The address is not decoration. Relative branches are computed from it, so bytes
+encoded for one address are wrong at another, and the result repeats it as
+`encoded_for_address`. A `jump` or `call` beyond the +/-2GB reach of a rel32
+displacement is refused rather than truncated into a plausible branch aimed
+somewhere else.
+
+Applying a patch stays in `debug_memory_write`, with its exact expected-bytes
+precondition and its exclusion of addresses holding owned breakpoints. There is
+no second path into a target's memory.
+
+| Limit | Behavior |
+|-------|----------|
+| Architectures | x86 and x64 only. ARM64 and every other machine type are refused, not decoded as x86 |
+| Instructions per call | 1-256, default 32 |
+| Truncated tail | An instruction the window cuts in half is dropped, and `truncated_tail` is set. `next_address` is where the next page starts |
+| Undecodable bytes | Decoding stops and `invalid_at` names the address. Walking off a function into data lands here |
+| Patch shapes | A closed set. There is no text assembler, so no parser accepts arbitrary input on the way to executable memory |
+| Nop run | 1-4096 bytes |

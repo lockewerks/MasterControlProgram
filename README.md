@@ -16,13 +16,14 @@
 
 > *"End of line."*
 
-**202 tools in v1.5.0.** Native Windows administration, desktop observation and
+**202 tools in v1.6.0.** Native Windows administration, desktop observation and
 input, addressable terminals and jobs, event recording, deterministic workflows,
 and process diagnostics with guarded debugger editing and binary analysis.
 
-The [control guide](docs/control-guide.md) covers the features added in v1.4.0
-and v1.5.0, including exact-target identities, connection and host lifetimes,
-partial results, and examples. MCP `tools/list` supplies the current input schemas.
+The [control guide](docs/control-guide.md) covers the features added in v1.4.0,
+v1.5.0 and v1.6.0, including exact-target identities, connection and host
+lifetimes, partial results, disassembly and patch encoding, and examples. MCP
+`tools/list` supplies the current input schemas.
 
 ---
 
