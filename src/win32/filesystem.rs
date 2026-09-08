@@ -844,52 +844,30 @@ fn disposition(file: &File) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Expands 8.3 short components in a path that already exists.
-///
-/// `FILE_RENAME_INFO` will not accept a destination carrying a short name:
-/// `C:\Users\RUNNER~1\...` comes back ERROR_INVALID_NAME while the same
-/// directory spelled `C:\Users\runneradmin\...` renames fine. A caller has no
-/// reason to know that, and short paths are ordinary: they are what `%TEMP%`
-/// holds for a long account name, and what a pasted `C:\PROGRA~1` looks like.
-fn long_path(path: &Path) -> anyhow::Result<PathBuf> {
-    let wide = to_wide(path_string(path)?);
-    let needed = unsafe { GetLongPathNameW(PCWSTR(wide.as_ptr()), None) };
-    if needed == 0 {
-        return Err(windows::core::Error::from_thread())
-            .with_context(|| format!("cannot expand {}", path.display()));
-    }
-    let mut buffer = vec![0u16; needed as usize];
-    let written = unsafe { GetLongPathNameW(PCWSTR(wide.as_ptr()), Some(&mut buffer)) };
-    // The second call can want more room than the first reported if the path
-    // changed underneath, which is a lost race rather than an answer to use.
-    if written == 0 || written as usize > buffer.len() {
-        return Err(windows::core::Error::from_thread())
-            .with_context(|| format!("cannot expand {}", path.display()));
-    }
-    Ok(PathBuf::from(String::from_utf16_lossy(
-        &buffer[..written as usize],
-    )))
-}
-
 fn rename_handle(file: &File, destination: &Path, replace: bool) -> anyhow::Result<()> {
-    // Expand the parent, not the whole path: the destination file is usually
-    // the thing being created and does not exist yet, and GetLongPathNameW
-    // needs what it is expanding to be there.
-    let destination = match (destination.parent(), destination.file_name()) {
-        (Some(parent), Some(name)) if !parent.as_os_str().is_empty() => {
-            long_path(parent)?.join(name)
-        }
-        _ => destination.to_path_buf(),
-    };
-    let destination = destination.as_path();
-    let name: Vec<u16> = path_string(destination)?.encode_utf16().collect();
+    // FileName must be NUL-terminated, and FileNameLength counts the bytes
+    // without the terminator.
+    //
+    // Terminating it explicitly matters more than it looks. The buffer below is
+    // a Vec<usize> sized by rounding the struct up to whole words, so a name
+    // that leaves the struct short of a word boundary gets one to seven zero
+    // bytes of padding after it and is NUL-terminated by accident. One that
+    // lands exactly on a word boundary gets none, and the rename fails with
+    // ERROR_INVALID_NAME. That is every destination whose length in UTF-16
+    // units is 2 more than a multiple of 4, so it looked like an intermittent
+    // fault of the machine rather than a property of the path.
+    let name: Vec<u16> = path_string(destination)?
+        .encode_utf16()
+        .chain(Some(0))
+        .collect();
+    let bytes = (name.len() - 1) * 2;
     let size = std::mem::offset_of!(FILE_RENAME_INFO, FileName) + name.len() * 2;
     let mut storage = vec![0usize; size.div_ceil(std::mem::size_of::<usize>())];
     let info = storage.as_mut_ptr().cast::<FILE_RENAME_INFO>();
     unsafe {
         (*info).Anonymous.ReplaceIfExists = replace;
         (*info).RootDirectory = HANDLE::default();
-        (*info).FileNameLength = u32::try_from(name.len() * 2)?;
+        (*info).FileNameLength = u32::try_from(bytes)?;
         std::ptr::copy_nonoverlapping(name.as_ptr(), (*info).FileName.as_mut_ptr(), name.len());
         SetFileInformationByHandle(
             handle(file),
@@ -2840,29 +2818,37 @@ mod tests {
         assert_eq!(read_value(&path, FileEncoding::Utf8)["data"], "two two");
     }
 
-    /// FILE_RENAME_INFO refuses a destination carrying an 8.3 component, so a
-    /// publish into one has to expand it first. The GitHub runner reaches this
-    /// through %TEMP%, which is `C:\Users\RUNNER~1\...` for a long account
-    /// name. `C:\PROGRA~1` is the equivalent that exists on most installs, and
-    /// where 8.3 creation is switched off there is nothing here to exercise.
+    /// Publishing must not depend on how long the destination path happens to
+    /// be. FILE_RENAME_INFO wants a NUL-terminated name and the rename buffer
+    /// is rounded up to whole words, so a name landing exactly on a word
+    /// boundary went unterminated and failed with ERROR_INVALID_NAME, while
+    /// every other length was terminated by the padding and worked.
+    ///
+    /// Names grow one character at a time so every residue is covered wherever
+    /// the fixture directory happens to sit, rather than assuming how long the
+    /// temp path on this machine is.
     #[test]
-    fn short_path_components_are_expanded_before_a_rename() {
-        let short = Path::new(r"C:\PROGRA~1");
-        let long = Path::new(r"C:\Program Files");
-        if !short.exists() {
-            eprintln!("skipping: this volume has no 8.3 name for Program Files");
-            return;
+    fn publication_survives_every_destination_path_length() {
+        let fixture = Fixture::new();
+        let offset = std::mem::offset_of!(FILE_RENAME_INFO, FileName);
+        let mut aligned = 0;
+        for extra in 0..8 {
+            let name = format!("pad{}.txt", "x".repeat(extra));
+            let path = fixture.path(&name);
+            let units = path.encode_utf16().count();
+            if (offset + units * 2).is_multiple_of(std::mem::size_of::<usize>()) {
+                aligned += 1;
+            }
+            write(create_input(&path, "one one", FileEncoding::Utf8))
+                .unwrap_or_else(|error| panic!("{units}-unit destination failed: {error:#}"));
+            assert_eq!(read_value(&path, FileEncoding::Utf8)["data"], "one one");
         }
-        assert_eq!(long_path(short).unwrap(), long);
-        // An already-long path must come back unchanged, not rewritten.
-        assert_eq!(long_path(long).unwrap(), long);
-        // A file under a short-named parent expands to a long-named parent
-        // while keeping its own name, which is the shape rename_handle builds.
-        assert_eq!(
-            long_path(short).unwrap().join("published.txt"),
-            long.join("published.txt")
+        // Eight consecutive lengths must include the word-boundary case, or
+        // this test passes without ever reaching the bug.
+        assert!(
+            aligned > 0,
+            "no destination landed on a word boundary, so nothing was proven"
         );
-        assert!(long_path(Path::new(r"C:\does-not-exist-4a1c9f")).is_err());
     }
 
     #[test]
