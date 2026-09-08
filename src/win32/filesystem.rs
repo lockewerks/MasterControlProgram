@@ -782,8 +782,9 @@ impl TemporaryFile {
                 CREATE_NEW,
                 FILE_ATTRIBUTE_NORMAL,
                 None,
-            )?
-        };
+            )
+        }
+        .with_context(|| format!("cannot create the temporary file {}", path.display()))?;
         Ok(Self {
             file: unsafe { File::from_raw_handle(native.0) },
             path,
@@ -858,7 +859,14 @@ fn rename_handle(file: &File, destination: &Path, replace: bool) -> anyhow::Resu
             FileRenameInfo,
             info.cast(),
             u32::try_from(size)?,
-        )?;
+        )
+        .with_context(|| {
+            format!(
+                "cannot rename onto {} ({} UTF-16 units, replace={replace})",
+                destination.display(),
+                name.len()
+            )
+        })?;
     }
     Ok(())
 }
