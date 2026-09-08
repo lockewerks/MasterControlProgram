@@ -1588,6 +1588,188 @@ fn combined_debugger_disconnect_detaches_and_resumes_its_exact_target() {
     host.shutdown(&mut second);
 }
 
+/// Proves the live disassembly path against a real stopped process: that the
+/// bytes come from the target rather than from its file on disk, that the
+/// decoder is handed the target's own bitness, and that an address carrying one
+/// of the debugger's own breakpoints disassembles as the original instruction
+/// instead of as the int3 that is physically in memory.
+#[test]
+#[ignore = "native debugger lifecycle against only an exact, disposable fixture process"]
+fn combined_debugger_disassembles_its_exact_target_around_its_own_breakpoints() {
+    let fixture = Fixture::new();
+    let name = format!("mcp-disasm-{}", uuid::Uuid::new_v4());
+    let mut host = Host::launch(&fixture, &name);
+    let mut client = host.connect(&fixture);
+    let mut input = fixture_job(&fixture, "wait", "debug");
+    input["lifetime"] = json!("persistent");
+    let job = json_text(&client.tool("job_start", input));
+    let process = FixtureProcess::open(&job);
+    wait_for_file(&fixture.path().join("debug.ready"));
+    let identity = json_text(&client.tool("diagnostics_process", json!({"pid": job["pid"]})));
+    let attached = json_text(&client.tool(
+        "debug_attach",
+        json!({
+            "pid": identity["pid"],
+            "creation_time": identity["creation_time"],
+            "lifetime": "connection",
+            "timeout_ms": 10000
+        }),
+    ));
+
+    let deadline = Instant::now() + RPC_TIMEOUT;
+    let stopped = loop {
+        let state = json_text(&client.tool("debug_inspect", json!({"id": attached["id"]})));
+        if state["state"] == "stopped" {
+            break state;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "debugger did not observe an attach stop: {state}"
+        );
+        thread::sleep(Duration::from_millis(10));
+    };
+    let stop_id = stopped["stop"]["stop_id"].clone();
+    let thread_id = stopped["stop"]["thread_id"].clone();
+
+    // Disassemble at the instruction pointer, resolved through the debugger's
+    // own evaluator so the address is the target's and not this test's guess.
+    // Every debugger command wraps its payload in a CommandReply, so the
+    // inspection's own fields live under "data".
+    let command = |client: &mut Mcp, body: Value| json_text(&client.tool("debug_command", body))["data"].clone();
+
+    let rip = json_text(&client.tool(
+        "debug_evaluate",
+        json!({
+            "id": attached["id"], "stop_id": stop_id,
+            "thread_id": thread_id, "expression": "@rip"
+        }),
+    ))["data"]
+        .clone();
+    let address = rip["value"].as_str().expect("evaluated rip").to_string();
+    let rip_value = number(&rip["value"]);
+
+    let decoded = command(
+        &mut client,
+        json!({
+            "id": attached["id"], "stop_id": stop_id,
+            "command": "disassemble", "address": address, "count": 8
+        }),
+    );
+    assert_eq!(
+        decoded["bitness"], 64,
+        "bitness must come from the target, not the host"
+    );
+    let instructions = decoded["instructions"]
+        .as_array()
+        .unwrap_or_else(|| panic!("decoded instructions: {decoded}"))
+        .clone();
+    assert!(!instructions.is_empty(), "no instructions at rip: {decoded}");
+    assert_eq!(
+        instructions[0]["address"].as_str().unwrap(),
+        format!("0x{rip_value:x}"),
+        "first instruction must sit exactly at rip"
+    );
+    assert!(
+        decoded["module"].is_string(),
+        "an address inside a mapped image must attribute to its module: {decoded}"
+    );
+
+    // The bytes must come from memory, not the file: read them back raw and
+    // confirm the disassembly describes the same bytes.
+    let raw = command(
+        &mut client,
+        json!({
+            "id": attached["id"], "stop_id": stop_id,
+            "command": "read_memory", "address": address, "length": 16
+        }),
+    );
+    let memory = STANDARD
+        .decode(raw["base64"].as_str().expect("memory bytes"))
+        .expect("base64 memory");
+    let first_length = number(&instructions[0]["length"]) as usize;
+    let first_bytes: Vec<String> = memory[..first_length]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    assert_eq!(
+        instructions[0]["bytes"].as_str().unwrap(),
+        first_bytes.join(" "),
+        "disassembled bytes disagree with the target's memory"
+    );
+
+    // Now plant a breakpoint on that exact instruction. Memory physically
+    // carries 0xcc afterwards, and the disassembly must still report the
+    // original instruction and say which addresses it masked.
+    let planted = client.tool(
+        "debug_breakpoint",
+        json!({
+            "id": attached["id"], "stop_id": stop_id, "action": "add",
+            "address": address, "expected_byte": memory[0].to_string()
+        }),
+    );
+    assert_success(&planted);
+
+    let patched = command(
+        &mut client,
+        json!({
+            "id": attached["id"], "stop_id": stop_id,
+            "command": "read_memory", "address": address, "length": 1
+        }),
+    );
+    let patched = STANDARD
+        .decode(patched["base64"].as_str().expect("patched byte"))
+        .expect("base64 patched byte");
+    assert_eq!(patched[0], 0xcc, "breakpoint was not written into memory");
+
+    let masked = command(
+        &mut client,
+        json!({
+            "id": attached["id"], "stop_id": stop_id,
+            "command": "disassemble", "address": address, "count": 8
+        }),
+    );
+    assert_eq!(
+        masked["breakpoints_masked"],
+        json!([format!("0x{rip_value:x}")]),
+        "disassembly did not report masking its own breakpoint"
+    );
+    assert_eq!(
+        masked["instructions"][0], instructions[0],
+        "a breakpoint changed what the target's code disassembles to"
+    );
+
+    // Take the breakpoint back out and detach before releasing the fixture.
+    // The target is still stopped at its attach break, so it cannot observe the
+    // release file until the debugger lets it run, and a live int3 left in its
+    // code would stop it again the moment it did.
+    assert_success(&client.tool(
+        "debug_breakpoint",
+        json!({
+            "id": attached["id"], "stop_id": stop_id,
+            "action": "remove", "address": address
+        }),
+    ));
+    client.disconnect();
+    let deadline = Instant::now() + RPC_TIMEOUT;
+    while process.debugger_attached() {
+        assert!(
+            Instant::now() < deadline,
+            "disconnect left the fixture debugger attached"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+
+    std::fs::write(fixture.path().join("debug.release"), b"prove target resumed")
+        .expect("release the fixture");
+    assert_eq!(
+        process.wait_for_exit(),
+        0,
+        "released target was killed or left stopped by a masked breakpoint"
+    );
+    let mut second = host.connect(&fixture);
+    host.shutdown(&mut second);
+}
+
 fn fixture_signal(directory: &Path, name: &str, bytes: &[u8]) {
     let pending = directory.join(format!("{name}.pending"));
     std::fs::write(&pending, bytes).expect("write fixture signal");

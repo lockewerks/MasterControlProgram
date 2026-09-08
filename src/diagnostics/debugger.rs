@@ -24,6 +24,7 @@ use windows::Win32::System::Threading::*;
 use super::native::{
     native_error, open_thread, timestamp_ms, Deadline, Handle, Process, ProcessIdentity,
 };
+use crate::disasm;
 use super::stacks::ThreadContext;
 use super::{
     BreakpointAction, ContinueDisposition, DebugAttachInput, DebugEventsInput, DebugLaunchInput,
@@ -2282,6 +2283,70 @@ fn execute(
                         "read_bytes": memory.bytes.len(), "partial": memory.bytes.len() != length,
                         "base64": base64::engine::general_purpose::STANDARD.encode(&memory.bytes), "error": memory.error,
                     }))
+                }
+                InspectionCommand::Disassemble { address, count } => {
+                    let count = count.unwrap_or(32);
+                    if !(1..=disasm::MAX_INSTRUCTIONS).contains(&count) {
+                        bail!(
+                            "disassembly count must be between 1 and {}",
+                            disasm::MAX_INSTRUCTIONS
+                        );
+                    }
+                    let bitness = disasm::Bitness::from_architecture(
+                        &target.process.identity.architecture,
+                    )?;
+                    let memory = read_memory(&target.process, address, disasm::bytes_for(count))?;
+                    if memory.bytes.is_empty() {
+                        bail!(
+                            "no readable bytes at 0x{address:x}: {}",
+                            memory.error.unwrap_or_else(|| "address not committed".into())
+                        );
+                    }
+
+                    let mut decoded = disasm::decode(&memory.bytes, address, bitness, count);
+
+                    // Breakpoints are patched into the target's memory, so a
+                    // raw read of an address with one on it disassembles as
+                    // int3 rather than the instruction that is really there.
+                    // Restoring the original bytes before decoding is the
+                    // difference between browsing the program and browsing the
+                    // debugger's own edits.
+                    let patched: Vec<_> = target
+                        .breakpoints
+                        .iter()
+                        .filter(|(at, breakpoint)| {
+                            breakpoint.patched
+                                && **at >= address
+                                && **at < address.saturating_add(memory.bytes.len() as u64)
+                        })
+                        .map(|(at, breakpoint)| (*at, breakpoint.original))
+                        .collect();
+                    if !patched.is_empty() {
+                        let mut bytes = memory.bytes.clone();
+                        for (at, original) in &patched {
+                            bytes[(at - address) as usize] = *original;
+                        }
+                        decoded = disasm::decode(&bytes, address, bitness, count);
+                        decoded["breakpoints_masked"] = json!(patched
+                            .iter()
+                            .map(|(at, _)| format!("0x{at:x}"))
+                            .collect::<Vec<_>>());
+                    }
+
+                    // Attribute the address to a module through the region's
+                    // allocation base, which the loader sets to the image base
+                    // for a mapped image. Picking the nearest module base below
+                    // the address would guess, and guess wrong for an address
+                    // in a heap allocation past the last module.
+                    if let Ok(region) = query_region(&target.process, address) {
+                        let base = region.AllocationBase as u64;
+                        if let Some(module) = target.modules.get(&base) {
+                            decoded["module"] = module["path"].clone();
+                            decoded["module_base"] = json!(format!("0x{base:x}"));
+                            decoded["rva"] = json!(format!("0x{:x}", address - base));
+                        }
+                    }
+                    Ok(decoded)
                 }
             }
         }

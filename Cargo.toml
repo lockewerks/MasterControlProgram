@@ -26,6 +26,17 @@ toml_edit = "0.25"
 uuid = { version = "1", features = ["v4"] }
 base64 = "0.22"
 jpeg-encoder = "0.6"
+# Disassembly and assembly for the binary analysis tools. Pure Rust, so it adds
+# no C toolchain to a build that currently needs none. default-features off
+# drops the std formatters we do not use; "masm" is the syntax Windows tooling
+# and every Microsoft reference writes, so a pasted operand matches the docs.
+iced-x86 = { version = "1.21", default-features = false, features = [
+    "std",
+    "decoder",
+    "encoder",
+    "instr_info",
+    "masm",
+] }
 anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

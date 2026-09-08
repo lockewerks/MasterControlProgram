@@ -16,9 +16,9 @@
 
 > *"End of line."*
 
-**199 tools in v1.5.0.** Native Windows administration, desktop observation and
+**202 tools in v1.5.0.** Native Windows administration, desktop observation and
 input, addressable terminals and jobs, event recording, deterministic workflows,
-and process diagnostics with guarded debugger editing.
+and process diagnostics with guarded debugger editing and binary analysis.
 
 The [control guide](docs/control-guide.md) covers the features added in v1.4.0
 and v1.5.0, including exact-target identities, connection and host lifetimes,
@@ -174,7 +174,7 @@ retried blindly.
 
 ## Tool catalog
 
-All 199 registered tool names are listed below. Use the input schema returned by
+All 202 registered tool names are listed below. Use the input schema returned by
 your server for action enums, required identities, supported scopes and bounds.
 Numeric fields with coercion accept decimal strings, which avoids rounding large
 Windows identities in clients that cannot represent every 64-bit integer.
@@ -211,6 +211,7 @@ Windows identities in clients that cannot represent every 64-bit integer.
 | Process diagnostics | `diagnostics_process` `process_dump` `process_stacks` `process_wait_chain` `process_handles` |
 | Debugger lifecycle and inspection | `debug_attach` `debug_launch` `debug_list` `debug_inspect` `debug_events` `debug_continue` `debug_break` `debug_detach` `debug_terminate` `debug_command` `debug_evaluate` |
 | Debugger editing | `debug_memory_write` `debug_breakpoint` `debug_step` |
+| Binary analysis | `binary_inspect` `binary_disassemble` `binary_encode` |
 
 The [control guide](docs/control-guide.md) explains how to use the new tool
 families without confusing accepted commands with observed results.

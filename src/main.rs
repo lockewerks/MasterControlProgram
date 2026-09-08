@@ -2,12 +2,14 @@
 //! Registration and installer hooks run before elevation or server initialization.
 
 mod administration;
+mod binary;
 mod clients;
 mod coerce;
 mod connection;
 mod context;
 mod desktop;
 mod diagnostics;
+mod disasm;
 mod elevate;
 mod execution;
 mod host;

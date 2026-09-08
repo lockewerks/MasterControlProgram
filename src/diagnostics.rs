@@ -215,6 +215,16 @@ pub enum InspectionCommand {
         #[serde(deserialize_with = "crate::coerce::num")]
         length: usize,
     },
+    Disassemble {
+        #[schemars(
+            description = "Unsigned numeric address, accepts decimal numeric strings. Use debug_evaluate to resolve @rip or a hex expression."
+        )]
+        #[serde(deserialize_with = "crate::coerce::num")]
+        address: u64,
+        #[schemars(description = "Instructions to decode, 1-256, default 32.")]
+        #[serde(default, deserialize_with = "crate::coerce::opt_num")]
+        count: Option<usize>,
+    },
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -318,7 +328,7 @@ fn bounded(
     Ok(value)
 }
 
-fn response<T: Serialize>(result: Result<T>) -> Result<CallToolResult, McpError> {
+pub(crate) fn response<T: Serialize>(result: Result<T>) -> Result<CallToolResult, McpError> {
     match result.and_then(|value| serde_json::to_string(&value).map_err(Into::into)) {
         Ok(value) => ok(value),
         Err(error) => err(format!("{error:#}")),

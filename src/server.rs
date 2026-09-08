@@ -685,7 +685,8 @@ impl MasterControlProgram {
                 + Self::workflow_router()
                 + Self::system_control_router()
                 + Self::administration_router()
-                + Self::diagnostics_router(),
+                + Self::diagnostics_router()
+                + Self::binary_router(),
         })
     }
 
