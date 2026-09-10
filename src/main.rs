@@ -12,6 +12,7 @@ mod diagnostics;
 mod disasm;
 mod elevate;
 mod execution;
+mod handshake;
 mod host;
 mod installer;
 mod observation;
@@ -206,9 +207,10 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let disconnected = server.execution_connection_cancel.clone();
-    let transport = connection::observe(stdio(), disconnected.clone());
+    let (reader, mut writer) = connection::observe(stdio(), disconnected.clone());
     let outcome = async {
-        let service = server.clone().serve(transport).await?;
+        let reader = handshake::answer_probes(reader, &mut writer).await?;
+        let service = server.clone().serve((reader, writer)).await?;
         tracing::info!("MCP server connected, waiting for requests");
         let cancel = service.cancellation_token();
         let waiting = service.waiting();
@@ -285,7 +287,8 @@ mod tests {
             "overlay::init()",
             "ps::Pool::from_env()",
             "connection::observe(stdio()",
-            ".serve(transport)",
+            "handshake::answer_probes(",
+            ".serve((reader, writer))",
         ];
         let positions: Vec<_> = stages
             .iter()

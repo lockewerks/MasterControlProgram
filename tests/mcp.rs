@@ -668,6 +668,26 @@ fn native_startup_and_legacy_tools_do_not_require_powershell() {
 }
 
 #[test]
+fn a_discovery_probe_before_initialize_leaves_the_server_serving() {
+    let fixture = Fixture::new();
+    let mut command = fixture_command(&fixture);
+    command.arg("--elevated").env("PATH", fixture.path());
+    let mut client = Mcp::spawn(command);
+    // Copilot CLI opens every stdio connection with the 2026-07-28 discovery
+    // probe and falls back to initialize when the server answers that it does
+    // not implement it. Answering with anything but -32601, exiting included,
+    // costs it the fallback. See github/copilot-cli#4370.
+    client.send(json!({"jsonrpc": "2.0", "id": 0, "method": "server/discover", "params": {}}));
+    let probe = client.response(0, RPC_TIMEOUT);
+    assert_eq!(probe["error"]["code"], -32601, "probe answer: {probe}");
+    client.initialize();
+    let id = client.request("tools/list", json!({}));
+    let response = client.response(id, RPC_TIMEOUT);
+    let tools = response["result"]["tools"].as_array().expect("tool list");
+    assert!(!tools.is_empty(), "the fallback handshake must serve tools");
+}
+
+#[test]
 fn registration_conflict_exits_before_server_initialization() {
     let fixture = Fixture::new();
     let not_a_directory = fixture.path().join("not-a-directory");
